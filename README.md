@@ -2,7 +2,7 @@
 
 > **DANGER: Untested, pre-alpha, experimental software.**
 > Do not run on any machine you care about. Do not run as root.
-> This gives the AutoGPT hosted platform the ability to execute commands on your computer.
+> This *maybe* gives the AutoGPT hosted platform the ability to execute commands on your computer.
 
 ---
 

@@ -1,0 +1,120 @@
+# OAuth Flow — Shim Authentication
+
+> **Status**: Spec / Not Implemented
+
+The shim authenticates using AutoGPT's **existing OAuth 2.0 provider infrastructure** —
+the same system used by third-party app integrations. No new auth infrastructure needed.
+
+## Why Not Device OAuth?
+
+AutoGPT already runs a full OAuth 2.0 Authorization Server:
+- `/auth/authorize` — authorization endpoint
+- `/auth/token` — token endpoint  
+- `introspect_token()` — token validation
+- Authorization Code + PKCE flow already implemented
+
+Device OAuth would be redundant. The shim registers as an OAuth app and uses
+Authorization Code + PKCE with a localhost redirect URI.
+
+---
+
+## Registration (One-Time)
+
+The shim is a first-party OAuth application registered in the AutoGPT platform:
+
+```
+Client ID:     autogpt-local-executor (well-known, public)
+Client Secret: none (PKCE replaces it for public clients)
+Redirect URI:  http://localhost:41899/callback
+Scopes:        local_executor:connect local_executor:shell local_executor:files
+               (optional) local_executor:computer_use local_executor:hardware
+```
+
+Port 41899 is reserved for the shim's local callback server.
+
+---
+
+## First-Time Auth Flow
+
+```
+User                    Shim                         AutoGPT Platform
+ |                       |                                |
+ | autogpt-shim auth     |                                |
+ |---------------------->|                                |
+ |                       | 1. Generate code_verifier      |
+ |                       |    code_challenge = S256(cv)   |
+ |                       |                                |
+ |                       | 2. Spin up localhost:41899      |
+ |                       |                                |
+ |                       | 3. Open browser →              |
+ |                       |    /auth/authorize?             |
+ |                       |      client_id=autogpt-local-executor
+ |                       |      redirect_uri=http://localhost:41899/callback
+ |                       |      code_challenge=...        |
+ |                       |      scope=local_executor:connect ...
+ |                       |                                |
+ |     [Browser opens]   |                                |
+ |<====================================================-->|
+ |     [User logs in and approves scopes]                 |
+ |                       |                                |
+ |                       |<-- GET /callback?code=AUTH_CODE
+ |                       |                                |
+ |                       | 4. POST /auth/token            |
+ |                       |      grant_type=authorization_code
+ |                       |      code=AUTH_CODE            |
+ |                       |      code_verifier=...         |
+ |                       |                                |
+ |                       |<-- {access_token, refresh_token, expires_in}
+ |                       |                                |
+ |                       | 5. Store tokens in OS keychain |
+ |                       |    (keyring library)           |
+ |    Auth complete       |                                |
+ |<----------------------|                                |
+```
+
+---
+
+## WebSocket Connection Auth
+
+On every WebSocket connect, the shim includes the access token:
+
+```
+GET /ws/local-executor/{session_id}
+Authorization: Bearer {access_token}
+```
+
+Platform validates via `introspect_token(access_token)`:
+- Checks token not expired
+- Checks token belongs to the session owner
+- Checks `local_executor:connect` scope present
+- Returns user_id for the session
+
+---
+
+## Token Refresh
+
+The shim manages token refresh proactively:
+- Refresh 5 minutes before expiry using stored `refresh_token`
+- On 401 during WebSocket upgrade, refresh and retry once
+- On refresh failure (expired refresh token), prompt user to re-auth via CLI: `autogpt-shim auth`
+
+Tokens stored in OS keychain:
+- macOS: Keychain Services via `keyring` library
+- Linux: Secret Service (GNOME Keyring / KWallet) via `keyring`
+- Windows: Windows Credential Manager via `keyring`
+
+---
+
+## Per-Capability Scopes
+
+| Capability | Required Scope |
+|-----------|----------------|
+| Shell execution | `local_executor:shell` |
+| File read/write | `local_executor:files` |
+| Computer use | `local_executor:computer_use` |
+| Hardware access | `local_executor:hardware` |
+| Local LLM | `local_executor:local_llm` |
+| Background tasks | `local_executor:background` |
+
+The platform only grants scopes the user explicitly approved during OAuth.
+The shim only advertises capabilities it has scopes for.

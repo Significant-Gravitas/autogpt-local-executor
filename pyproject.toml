@@ -36,6 +36,13 @@ hardware = [
 local-llm = [
     "ollama>=0.2",
 ]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
 all = [
     "autogpt-local-executor[computer-use,hardware,local-llm]",
 ]
@@ -45,3 +52,20 @@ autogpt-shim = "autogpt_local_executor.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["autogpt_local_executor"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

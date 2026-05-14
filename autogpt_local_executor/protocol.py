@@ -10,8 +10,10 @@ import time
 import uuid
 from typing import Any
 
-import pyautogui  # noqa: used for screen resolution detection below
-# If pyautogui not installed, screen_resolution advertised as None
+try:
+    import pyautogui as _pyautogui
+except ImportError:
+    _pyautogui = None  # type: ignore[assignment]
 
 
 class MessageType:
@@ -41,7 +43,7 @@ def build_hello(config: Any) -> dict:
     capabilities = []
     if config.enable_shell:
         capabilities.append("shell")
-    capabilities.append("files")  # always advertised
+    capabilities.append("files")
     if config.enable_computer_use:
         capabilities.append("computer_use")
     if config.enable_local_llm:
@@ -50,10 +52,9 @@ def build_hello(config: Any) -> dict:
         capabilities.append("hardware_serial")
 
     screen_resolution = None
-    if config.enable_computer_use:
+    if config.enable_computer_use and _pyautogui is not None:
         try:
-            import pyautogui
-            screen_resolution = list(pyautogui.size())
+            screen_resolution = list(_pyautogui.size())
         except Exception:
             pass
 
@@ -69,8 +70,8 @@ def build_hello(config: Any) -> dict:
             "screen_resolution": screen_resolution,
             "capabilities": capabilities,
             "allowed_root": str(config.allowed_root),
-            "local_llm_models": [],  # TODO: query ollama /api/tags
-            "hardware_devices": [],  # TODO: enumerate serial/USB
+            "local_llm_models": [],
+            "hardware_devices": [],
         },
     }
 

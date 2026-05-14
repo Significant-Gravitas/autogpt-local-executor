@@ -1,5 +1,5 @@
 """
-Shim configuration — loaded from ~/.autogpt/shim-config.toml or CLI args.
+Shim configuration — loaded from environment vars or CLI args.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class ShimConfig(BaseSettings):
@@ -19,9 +19,10 @@ class ShimConfig(BaseSettings):
     Loaded from (in order of precedence):
     1. CLI flags
     2. Environment variables (AUTOGPT_SHIM_*)
-    3. ~/.autogpt/shim-config.toml
-    4. Defaults below
+    3. Defaults below
     """
+
+    model_config = SettingsConfigDict(env_prefix="AUTOGPT_SHIM_", extra="ignore")
 
     # --- Platform connection ---
     platform_ws_url: str = Field(
@@ -34,45 +35,36 @@ class ShimConfig(BaseSettings):
     )
     oauth_client_id: str = Field(
         default="autogpt-local-executor",
-        description="Well-known OAuth client ID for the shim. Do not change.",
+        description="Well-known OAuth client ID for the shim.",
     )
     oauth_redirect_port: int = Field(
         default=41899,
         description="Local port for the OAuth callback server during auth flow.",
     )
 
+    # --- Session ---
+    session_id: str | None = Field(
+        default=None,
+        description="Session ID assigned by the platform. Set by daemon at connect time.",
+    )
+
     # --- Machine identity ---
     machine_id: str = Field(
         default_factory=lambda: f"{platform.node()}-{uuid.uuid4().hex[:8]}",
-        description="Stable identifier for this machine. Auto-generated on first run, "
-                    "persisted to config file.",
+        description="Stable identifier for this machine.",
     )
 
     # --- File access ---
     allowed_root: Path = Field(
         default_factory=lambda: Path.home() / ".autogpt" / "workspace",
-        description="All file operations are jailed to this directory. "
-                    "NEVER set to / or your home directory.",
+        description="All file operations are jailed to this directory.",
     )
 
     # --- Capabilities to advertise ---
-    enable_shell: bool = Field(
-        default=True,
-        description="Allow the platform to execute shell commands.",
-    )
-    enable_computer_use: bool = Field(
-        default=False,
-        description="Allow the platform to take screenshots and inject input. "
-                    "REQUIRES explicit opt-in. Off by default.",
-    )
-    enable_local_llm: bool = Field(
-        default=False,
-        description="Allow the platform to route LLM inference to a local Ollama instance.",
-    )
-    enable_hardware: bool = Field(
-        default=False,
-        description="Allow the platform to access serial ports, USB devices, GPIO.",
-    )
+    enable_shell: bool = Field(default=True)
+    enable_computer_use: bool = Field(default=False)
+    enable_local_llm: bool = Field(default=False)
+    enable_hardware: bool = Field(default=False)
 
     # --- Rate limits ---
     max_commands_per_minute: int = Field(default=60)
@@ -88,6 +80,3 @@ class ShimConfig(BaseSettings):
     # --- Reconnect ---
     reconnect_base_delay: float = Field(default=1.0)
     reconnect_max_delay: float = Field(default=60.0)
-
-    class Config:
-        env_prefix = "AUTOGPT_SHIM_"

@@ -49,6 +49,7 @@ autogpt-shim start   # Connect and run
 | [OAUTH_FLOW.md](docs/OAUTH_FLOW.md) | Auth design (uses AutoGPT's existing OAuth provider) |
 | [SECURITY.md](docs/SECURITY.md) | Threat model and defense layers |
 | [PLATFORM_HOOKS.md](docs/PLATFORM_HOOKS.md) | Platform-side insertion points |
+| [CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md) | Per-OS support matrix and path-jail strategy |
 
 ## Contributing
 

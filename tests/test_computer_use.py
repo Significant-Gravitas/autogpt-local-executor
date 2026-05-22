@@ -2,87 +2,90 @@
 
 from __future__ import annotations
 
-import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from autogpt_local_executor.config import ShimConfig
 from autogpt_local_executor.handlers import ComputerUseHandler
-from autogpt_local_executor.protocol import MessageType
+from autogpt_local_executor.protocol import (
+    ErrorCode,
+    ErrorMessage,
+    ScreenshotRequestMessage,
+    ScreenshotRequestPayload,
+    ScreenshotResponseMessage,
+    new_id,
+    now_ts,
+)
 
 
 def make_config(tmp_path: Path, enable: bool = True) -> ShimConfig:
     return ShimConfig(
         allowed_root=tmp_path,
+        audit_log_path=tmp_path / "_audit.log",
         enable_computer_use=enable,
-        platform_ws_url="ws://localhost:9999/ws/local-executor",
-        platform_oauth_url="http://localhost:9999/auth",
+        platform_url="http://localhost:9999",
         machine_id="test-machine",
     )
 
 
-def make_msg(msg_type: str, payload: dict) -> dict:
-    return {"type": msg_type, "id": str(uuid.uuid4()), "ts": 0.0, "payload": payload}
+def _screenshot_msg(**kw) -> ScreenshotRequestMessage:
+    return ScreenshotRequestMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=ScreenshotRequestPayload(**kw),
+    )
 
 
 @pytest.mark.asyncio
 async def test_screenshot_disabled(tmp_path: Path) -> None:
-    config = make_config(tmp_path, enable=False)
-    handler = ComputerUseHandler(config)
-    msg = make_msg(MessageType.SCREENSHOT_REQUEST, {})
-    resp = await handler.handle(msg)
-    assert resp["type"] == MessageType.ERROR
-    assert resp["payload"]["code"] == "CAPABILITY_NOT_GRANTED"
+    handler = ComputerUseHandler(make_config(tmp_path, enable=False))
+    resp = await handler.handle(_screenshot_msg())
+    assert isinstance(resp, ErrorMessage)
+    assert resp.payload.code == ErrorCode.CAPABILITY_NOT_GRANTED
 
 
 @pytest.mark.asyncio
 async def test_screenshot_no_pyautogui(tmp_path: Path) -> None:
-    config = make_config(tmp_path, enable=True)
-    handler = ComputerUseHandler(config)
-    msg = make_msg(MessageType.SCREENSHOT_REQUEST, {})
-
+    handler = ComputerUseHandler(make_config(tmp_path, enable=True))
     import autogpt_local_executor.handlers as h_mod
+
     original = h_mod._pyautogui
     h_mod._pyautogui = None
     try:
-        resp = await handler.handle(msg)
+        resp = await handler.handle(_screenshot_msg())
     finally:
         h_mod._pyautogui = original
-
-    assert resp["type"] == MessageType.ERROR
-    assert resp["payload"]["code"] == "DEPENDENCY_MISSING"
+    assert isinstance(resp, ErrorMessage)
+    assert resp.payload.code == ErrorCode.DEPENDENCY_MISSING
 
 
 @pytest.mark.asyncio
-async def test_screenshot_returns_base64(tmp_path: Path) -> None:
-    config = make_config(tmp_path, enable=True)
-    handler = ComputerUseHandler(config)
-    msg = make_msg(MessageType.SCREENSHOT_REQUEST, {"quality": 75})
-
-    import io
-    from unittest.mock import MagicMock
-    from PIL import Image
+async def test_screenshot_returns_image_base64(tmp_path: Path) -> None:
+    handler = ComputerUseHandler(make_config(tmp_path, enable=True))
+    try:
+        from PIL import Image  # type: ignore[import-untyped]
+    except ImportError:
+        pytest.skip("Pillow not available")
 
     fake_img = Image.new("RGB", (100, 50), color=(255, 0, 0))
-
-    mock_pyautogui = MagicMock()
-    mock_pyautogui.screenshot.return_value = fake_img
+    mock_pg = MagicMock()
+    mock_pg.screenshot.return_value = fake_img
 
     import autogpt_local_executor.handlers as h_mod
-    original_pg = h_mod._pyautogui
-    original_img = h_mod._Image
-    h_mod._pyautogui = mock_pyautogui
+
+    orig_pg, orig_img = h_mod._pyautogui, h_mod._Image
+    h_mod._pyautogui = mock_pg
     h_mod._Image = Image
     try:
-        resp = await handler.handle(msg)
+        resp = await handler.handle(_screenshot_msg(quality=75))
     finally:
-        h_mod._pyautogui = original_pg
-        h_mod._Image = original_img
+        h_mod._pyautogui = orig_pg
+        h_mod._Image = orig_img
 
-    assert resp["type"] == MessageType.SCREENSHOT_RESPONSE
-    assert resp["payload"]["encoding"] == "base64"
-    assert len(resp["payload"]["image"]) > 0
-    assert resp["payload"]["width"] == 100
-    assert resp["payload"]["height"] == 50
+    assert isinstance(resp, ScreenshotResponseMessage)
+    assert resp.payload.mime_type == "image/jpeg"
+    assert len(resp.payload.image_base64) > 0
+    assert resp.payload.width == 100
+    assert resp.payload.height == 50

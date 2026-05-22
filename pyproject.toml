@@ -53,6 +53,9 @@ autogpt-shim = "autogpt_local_executor.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["autogpt_local_executor"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"autogpt_local_executor/templates" = "autogpt_local_executor/templates"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

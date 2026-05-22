@@ -86,7 +86,7 @@ class OAuthFlow:
         "local_executor:files",
     ]
 
-    def __init__(self, config: Any, token_store: KeychainTokenStore) -> None:  # noqa: F821
+    def __init__(self, config, token_store: KeychainTokenStore) -> None:
         self.config = config
         self.token_store = token_store
 
@@ -111,7 +111,7 @@ class OAuthFlow:
             raise ValueError("No refresh token stored. Run `autogpt-shim auth` first.")
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self.config.platform_oauth_url}/token",
+                f"{self.config.derived_oauth_url}/token",
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh,
@@ -142,7 +142,7 @@ class OAuthFlow:
             "code_challenge_method": "S256",
             "state": secrets.token_urlsafe(16),
         }
-        return f"{self.config.platform_oauth_url}/authorize?" + urllib.parse.urlencode(params)
+        return f"{self.config.derived_oauth_url}/authorize?" + urllib.parse.urlencode(params)
 
     def _wait_for_callback(self) -> str:
         auth_code: list[str] = []
@@ -171,7 +171,7 @@ class OAuthFlow:
     async def _exchange_code(self, auth_code: str, code_verifier: str) -> dict:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self.config.platform_oauth_url}/token",
+                f"{self.config.derived_oauth_url}/token",
                 data={
                     "grant_type": "authorization_code",
                     "code": auth_code,

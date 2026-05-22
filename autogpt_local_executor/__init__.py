@@ -19,4 +19,8 @@ Architecture overview:
 """
 
 __version__ = "0.0.1-experimental"
-__all__ = ["ShimDaemon", "ShimConfig"]
+
+from .config import ShimConfig, load_config
+from .daemon import ShimDaemon
+
+__all__ = ["ShimConfig", "ShimDaemon", "load_config", "__version__"]

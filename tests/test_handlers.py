@@ -530,8 +530,13 @@ async def test_command_timeout(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_command_audit_log_written(tmp_path: Path) -> None:
+    import json
+
+    from autogpt_local_executor.audit import AuditWriter
+
     config = make_config(tmp_path)
-    h = CommandHandler(config)
+    audit = AuditWriter(path=config.audit_log_path, audit_key=b"\0" * 32)
+    h = CommandHandler(config, audit=audit)
     fake = _FakeProc(stdout=b"", stderr=b"", returncode=0)
 
     async def fake_exec(*args, **kwargs):
@@ -542,8 +547,12 @@ async def test_command_audit_log_written(tmp_path: Path) -> None:
         await h.handle(msg)
 
     assert config.audit_log_path.exists()
-    contents = config.audit_log_path.read_text()
-    assert "cmd=" in contents
+    lines = config.audit_log_path.read_text().splitlines()
+    rec = json.loads(lines[-1])
+    assert rec["op"] == "EXECUTE_COMMAND"
+    assert rec["details"]["argv"] == ["echo", "hi"]
+    assert rec["result"]["ok"] is True
+    assert rec["hmac"]
 
 
 @pytest.mark.asyncio

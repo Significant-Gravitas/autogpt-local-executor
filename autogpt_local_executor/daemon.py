@@ -22,6 +22,7 @@ import websockets
 from pydantic import BaseModel, ValidationError
 
 from . import platform_info
+from .audit import AuditWriter, get_or_create_audit_key
 from .auth import KeychainTokenStore
 from .config import ShimConfig
 from .handlers import CommandHandler, ComputerUseHandler, FileHandler
@@ -57,15 +58,43 @@ class ShimDaemon:
         self,
         config: ShimConfig,
         token_store: KeychainTokenStore | Any | None = None,
+        audit: AuditWriter | None = None,
     ) -> None:
         self.config = config
         self.token_store = token_store or KeychainTokenStore()
-        self._file_handler = FileHandler(config)
-        self._command_handler = CommandHandler(config)
-        self._computer_handler = ComputerUseHandler(config)
+        self.audit = audit if audit is not None else self._build_audit_writer(config)
+        if self.audit is not None:
+            self.audit.set_machine_id(config.machine_id)
+            if config.session_id:
+                self.audit.set_session_id(config.session_id)
+        self._file_handler = FileHandler(config, audit=self.audit)
+        self._command_handler = CommandHandler(config, audit=self.audit)
+        self._computer_handler = ComputerUseHandler(config, audit=self.audit)
         self._running = False
         self._ws: Any = None
         self._semaphore: asyncio.Semaphore | None = None
+        self._shim_start_logged = False
+
+    @staticmethod
+    def _build_audit_writer(config: ShimConfig) -> AuditWriter | None:
+        """Best-effort AuditWriter construction. Returns None and emits a
+        warning when the audit key can't be acquired so the daemon can still
+        start in degraded mode; production deployments should treat this as
+        fatal but for v0 we don't want to brick a fresh install over a
+        keychain hiccup."""
+        try:
+            key = get_or_create_audit_key()
+            return AuditWriter(
+                path=config.audit_log_path,
+                audit_key=key,
+                machine_id=config.machine_id,
+                session_id=config.session_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Audit log disabled — could not acquire audit key: %s", exc
+            )
+            return None
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -74,25 +103,29 @@ class ShimDaemon:
         reconnect on any failure.
         """
         self._running = True
+        await self._audit_shim_start()
         attempt = 0
-        while self._running:
-            try:
-                await self._session()
-                attempt = 0
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not self._running:
-                    break
-                delay = self._backoff_delay(attempt)
-                logger.warning(
-                    "Disconnected (%s). Reconnecting in %.1fs (attempt %d)",
-                    exc,
-                    delay,
-                    attempt + 1,
-                )
-                await asyncio.sleep(delay)
-                attempt += 1
+        try:
+            while self._running:
+                try:
+                    await self._session()
+                    attempt = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if not self._running:
+                        break
+                    delay = self._backoff_delay(attempt)
+                    logger.warning(
+                        "Disconnected (%s). Reconnecting in %.1fs (attempt %d)",
+                        exc,
+                        delay,
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(delay)
+                    attempt += 1
+        finally:
+            await self._audit_shim_stop("graceful")
 
     async def stop(self) -> None:
         self._running = False
@@ -101,6 +134,23 @@ class ShimDaemon:
                 await self._ws.close()
             except Exception:
                 pass
+
+    async def _audit_shim_start(self) -> None:
+        if self.audit is None or self._shim_start_logged:
+            return
+        try:
+            await self.audit.shim_start(self.config.machine_id)
+            self._shim_start_logged = True
+        except Exception:
+            logger.debug("SHIM_START audit emit failed", exc_info=True)
+
+    async def _audit_shim_stop(self, reason: str) -> None:
+        if self.audit is None or not self._shim_start_logged:
+            return
+        try:
+            await self.audit.shim_stop(reason)
+        except Exception:
+            logger.debug("SHIM_STOP audit emit failed", exc_info=True)
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
@@ -142,12 +192,27 @@ class ShimDaemon:
 
     async def _run_session(self, ws) -> None:
         self._ws = ws
-        await self._handshake(ws)
+        if self.audit is not None:
+            try:
+                await self.audit.ws_connected(self._connect_url())
+            except Exception:
+                logger.debug("WS_CONNECTED audit emit failed", exc_info=True)
+        disconnect_reason = "clean_exit"
         try:
-            async for raw in ws:
-                await self._on_frame(ws, raw)
+            await self._handshake(ws)
+            try:
+                async for raw in ws:
+                    await self._on_frame(ws, raw)
+            except Exception as exc:
+                disconnect_reason = f"loop_error: {exc.__class__.__name__}"
+                raise
         finally:
             self._ws = None
+            if self.audit is not None:
+                try:
+                    await self.audit.ws_disconnected(disconnect_reason)
+                except Exception:
+                    logger.debug("WS_DISCONNECTED audit emit failed", exc_info=True)
 
     def _connect_url(self) -> str:
         session_id = self.config.session_id or "default"
@@ -172,6 +237,11 @@ class ShimDaemon:
 
             flow = OAuthFlow(self.config, self.token_store)
             await flow.refresh_token()
+            if self.audit is not None:
+                try:
+                    await self.audit.token_refreshed()
+                except Exception:
+                    logger.debug("TOKEN_REFRESHED audit emit failed", exc_info=True)
             return await self.token_store.get_access_token()
         except Exception as exc:
             logger.warning("Token refresh failed: %s", exc)
@@ -194,6 +264,14 @@ class ShimDaemon:
         self.config.command_timeout_seconds = payload.command_timeout_seconds
         self.config.max_file_size_bytes = payload.max_file_size_bytes
         self._semaphore = asyncio.Semaphore(payload.max_concurrent)
+        # Tell the AuditWriter about the now-known session_id so subsequent
+        # records get correctly attributed.
+        if self.audit is not None:
+            self.audit.set_session_id(payload.session_id)
+            try:
+                await self.audit.config_reloaded(payload.granted_capabilities)
+            except Exception:
+                logger.debug("CONFIG_RELOADED audit emit failed", exc_info=True)
         logger.info(
             "Connected. session=%s granted_capabilities=%s max_concurrent=%d timeout=%ds",
             payload.session_id,

@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 from . import platform_info
+from .audit import AuditWriter
 from .config import ShimConfig
 from .path_jail import PathJailError, assert_inside_jail
 from .protocol import (
@@ -76,6 +77,33 @@ logger = logging.getLogger(__name__)
 
 def _jail_error_to_message(msg_id: str, exc: PathJailError) -> ErrorMessage:
     return make_error(msg_id, exc.code, exc.message)
+
+
+def _ok_result(duration_ms: int, *, exit_code: int | None = None) -> dict:
+    return {"ok": True, "exit_code": exit_code, "duration_ms": duration_ms, "error_code": None}
+
+
+def _err_result(duration_ms: int, error_code: str, *, exit_code: int | None = None) -> dict:
+    return {"ok": False, "exit_code": exit_code, "duration_ms": duration_ms, "error_code": error_code}
+
+
+def _elapsed_ms(start: float) -> int:
+    return int((time.monotonic() - start) * 1000)
+
+
+async def _audit_jail_violation(
+    audit: AuditWriter | None,
+    op: str,
+    raw_path: str,
+    exc: PathJailError,
+) -> None:
+    """Mirror a path-jail rejection into the audit log as JAIL_VIOLATION."""
+    if audit is None:
+        return
+    try:
+        await audit.jail_violation(exc.code, raw_path, op=op)
+    except Exception:
+        logger.debug("Failed to write JAIL_VIOLATION audit record", exc_info=True)
 
 
 def _safe_env_baseline() -> dict[str, str]:
@@ -131,24 +159,34 @@ def _merge_env(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
 
 
 class CommandHandler:
-    def __init__(self, config: ShimConfig) -> None:
+    def __init__(
+        self,
+        config: ShimConfig,
+        audit: AuditWriter | None = None,
+    ) -> None:
         self.config = config
+        self.audit = audit
 
     async def handle(self, msg: ExecuteCommandMessage) -> CommandResultMessage | ErrorMessage:
         payload = msg.payload
+        start = time.monotonic()
 
         # Validate command vs argv mutual exclusion.
         if (payload.command is None) == (payload.argv is None):
-            return make_error(
+            err = "Exactly one of `command` or `argv` must be set."
+            await self._audit(
                 msg.id,
-                ErrorCode.INTERNAL_ERROR,
-                "Exactly one of `command` or `argv` must be set.",
+                payload,
+                cwd=payload.cwd or str(self.config.allowed_root),
+                result=_err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
             )
+            return make_error(msg.id, ErrorCode.INTERNAL_ERROR, err)
 
         cwd_str = payload.cwd or str(self.config.allowed_root)
         try:
             cwd = assert_inside_jail(cwd_str, self.config.allowed_root)
         except PathJailError as exc:
+            await _audit_jail_violation(self.audit, "EXECUTE_COMMAND", cwd_str, exc)
             return _jail_error_to_message(msg.id, exc)
 
         timeout = payload.timeout_seconds or self.config.command_timeout_seconds
@@ -166,9 +204,6 @@ class CommandHandler:
             # New session = new pgid so we can kill the whole tree.
             preexec_fn = os.setsid  # type: ignore[attr-defined]
 
-        await self._audit_log(payload, cwd)
-
-        start = time.monotonic()
         timed_out = False
         stdout_b: bytes = b""
         stderr_b: bytes = b""
@@ -186,6 +221,12 @@ class CommandHandler:
             else:
                 resolved = platform_info.resolve_shell(payload.shell.value)
                 if resolved is None:
+                    await self._audit(
+                        msg.id,
+                        payload,
+                        cwd=str(cwd),
+                        result=_err_result(_elapsed_ms(start), ErrorCode.SHELL_NOT_AVAILABLE.value),
+                    )
                     return make_error(
                         msg.id,
                         ErrorCode.SHELL_NOT_AVAILABLE,
@@ -204,6 +245,12 @@ class CommandHandler:
                     preexec_fn=preexec_fn,
                 )
         except FileNotFoundError as exc:
+            await self._audit(
+                msg.id,
+                payload,
+                cwd=str(cwd),
+                result=_err_result(_elapsed_ms(start), ErrorCode.SHELL_NOT_AVAILABLE.value),
+            )
             return make_error(
                 msg.id,
                 ErrorCode.SHELL_NOT_AVAILABLE,
@@ -211,6 +258,12 @@ class CommandHandler:
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("Failed to spawn subprocess")
+            await self._audit(
+                msg.id,
+                payload,
+                cwd=str(cwd),
+                result=_err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
         try:
@@ -228,7 +281,14 @@ class CommandHandler:
                 pass
             exit_code = proc.returncode if proc.returncode is not None else -1
 
-        duration = time.monotonic() - start
+        elapsed_ms = _elapsed_ms(start)
+        duration = elapsed_ms / 1000.0
+
+        if timed_out:
+            result = _err_result(elapsed_ms, ErrorCode.COMMAND_TIMEOUT.value, exit_code=exit_code)
+        else:
+            result = _ok_result(elapsed_ms, exit_code=exit_code)
+        await self._audit(msg.id, payload, cwd=str(cwd), result=result, env=env)
 
         return CommandResultMessage(
             id=msg.id,
@@ -292,34 +352,51 @@ class CommandHandler:
         except Exception:  # pragma: no cover - best-effort
             logger.exception("Error terminating subprocess tree")
 
-    async def _audit_log(self, payload, cwd: Path) -> None:
-        """Append a single line to the audit log. Best-effort; never fatal."""
+    async def _audit(
+        self,
+        request_id: str,
+        payload,
+        *,
+        cwd: str,
+        result: dict,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        """Emit an EXECUTE_COMMAND record. Never logs env *values* — only the
+        list of keys, per AUDIT_LOG.md "What's NEVER logged"."""
+        if self.audit is None:
+            return
+        # Prefer the merged env if we got that far; otherwise the wire env.
+        env_keys = sorted((env or payload.env or {}).keys())
+        details = {
+            "command": payload.command,
+            "argv": payload.argv,
+            "shell": payload.shell.value,
+            "cwd": cwd,
+            "env_keys": env_keys,
+            "timeout_seconds": payload.timeout_seconds or self.config.command_timeout_seconds,
+        }
         try:
-            log_path = Path(self.config.audit_log_path)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            line = (
-                f"{now_ts():.3f}\t"
-                f"session={self.config.session_id or '-'}\t"
-                f"cwd={cwd}\t"
-                f"shell={payload.shell.value if payload.command else 'argv'}\t"
-                f"cmd={payload.command or payload.argv}\n"
+            await self.audit.write(
+                "EXECUTE_COMMAND",
+                request_id=request_id,
+                details=details,
+                result=result,
             )
-            await asyncio.to_thread(_append_line, log_path, line)
         except Exception:
-            logger.debug("Audit log write failed", exc_info=True)
-
-
-def _append_line(path: Path, line: str) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line)
+            logger.debug("Failed to write EXECUTE_COMMAND audit record", exc_info=True)
 
 
 # ── FILE_* handlers ──────────────────────────────────────────────────────────
 
 
 class FileHandler:
-    def __init__(self, config: ShimConfig) -> None:
+    def __init__(
+        self,
+        config: ShimConfig,
+        audit: AuditWriter | None = None,
+    ) -> None:
         self.config = config
+        self.audit = audit
 
     # -- FILE_READ -----------------------------------------------------------
 
@@ -327,16 +404,29 @@ class FileHandler:
         self, msg: FileReadMessage
     ) -> FileContentsMessage | ErrorMessage:
         payload = msg.payload
+        start = time.monotonic()
         try:
             path = assert_inside_jail(payload.path, self.config.allowed_root)
         except PathJailError as exc:
+            await _audit_jail_violation(self.audit, "FILE_READ", payload.path, exc)
             return _jail_error_to_message(msg.id, exc)
 
+        details_base = {
+            "path": str(path),
+            "encoding": payload.encoding.value,
+            "offset": payload.offset,
+            "length": payload.length,
+        }
+
         if not path.exists():
+            await self._emit("FILE_READ", msg.id, {**details_base, "size_bytes_returned": 0},
+                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
             return make_error(
                 msg.id, ErrorCode.PATH_NOT_FOUND, f"{path} does not exist"
             )
         if path.is_dir():
+            await self._emit("FILE_READ", msg.id, {**details_base, "size_bytes_returned": 0},
+                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
             return make_error(
                 msg.id,
                 ErrorCode.INTERNAL_ERROR,
@@ -345,6 +435,8 @@ class FileHandler:
 
         size = path.stat().st_size
         if size > self.config.max_file_size_bytes:
+            await self._emit("FILE_READ", msg.id, {**details_base, "size_bytes_returned": 0},
+                             _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value))
             return make_error(
                 msg.id,
                 ErrorCode.FILE_TOO_LARGE,
@@ -367,6 +459,13 @@ class FileHandler:
             content = chunk.decode("utf-8", errors="replace")
             wire_encoding = Encoding.UTF8
 
+        await self._emit(
+            "FILE_READ",
+            msg.id,
+            {**details_base, "size_bytes_returned": len(chunk)},
+            _ok_result(_elapsed_ms(start)),
+        )
+
         return FileContentsMessage(
             id=msg.id,
             ts=now_ts(),
@@ -384,15 +483,29 @@ class FileHandler:
         self, msg: FileWriteMessage
     ) -> AckMessage | ErrorMessage:
         payload = msg.payload
+        start = time.monotonic()
         try:
             path = self._jail_for_write(payload.path, payload.create_parents)
         except PathJailError as exc:
+            await _audit_jail_violation(self.audit, "FILE_WRITE", payload.path, exc)
             return _jail_error_to_message(msg.id, exc)
+
+        details_base = {
+            "path": str(path),
+            "encoding": payload.encoding.value,
+            "create_parents": payload.create_parents,
+        }
 
         if payload.encoding == Encoding.BASE64:
             try:
                 raw = base64.b64decode(payload.content, validate=True)
             except (ValueError, binascii.Error) as exc:
+                await self._emit(
+                    "FILE_WRITE",
+                    msg.id,
+                    {**details_base, "size_bytes_written": 0},
+                    _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+                )
                 return make_error(
                     msg.id, ErrorCode.INTERNAL_ERROR, f"Bad base64: {exc}"
                 )
@@ -400,6 +513,12 @@ class FileHandler:
             raw = payload.content.encode("utf-8")
 
         if len(raw) > self.config.max_file_size_bytes:
+            await self._emit(
+                "FILE_WRITE",
+                msg.id,
+                {**details_base, "size_bytes_written": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value),
+            )
             return make_error(
                 msg.id,
                 ErrorCode.FILE_TOO_LARGE,
@@ -410,6 +529,12 @@ class FileHandler:
             await asyncio.to_thread(lambda: path.parent.mkdir(parents=True, exist_ok=True))
 
         await asyncio.to_thread(path.write_bytes, raw)
+        await self._emit(
+            "FILE_WRITE",
+            msg.id,
+            {**details_base, "size_bytes_written": len(raw)},
+            _ok_result(_elapsed_ms(start)),
+        )
         return make_ack(msg.id)
 
     def _jail_for_write(self, raw_path: str, create_parents: bool) -> Path:
@@ -443,10 +568,14 @@ class FileHandler:
         self, msg: FileStatMessage
     ) -> FileStatResponseMessage | ErrorMessage:
         payload = msg.payload
+        start = time.monotonic()
         try:
             path = assert_inside_jail(payload.path, self.config.allowed_root)
         except PathJailError as exc:
+            await _audit_jail_violation(self.audit, "FILE_STAT", payload.path, exc)
             return _jail_error_to_message(msg.id, exc)
+
+        details = {"path": str(path), "follow_symlinks": payload.follow_symlinks}
 
         # Real-resolve here too if follow_symlinks asked (realpath already ran
         # in the jail; path is the resolved form).
@@ -456,12 +585,15 @@ class FileHandler:
             else:
                 st = await asyncio.to_thread(os.lstat, str(path))
         except FileNotFoundError:
+            await self._emit("FILE_STAT", msg.id, details, _ok_result(_elapsed_ms(start)))
             return FileStatResponseMessage(
                 id=msg.id,
                 ts=now_ts(),
                 payload=FileStatResponsePayload(exists=False),
             )
         except OSError as exc:
+            await self._emit("FILE_STAT", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
         is_file = stat.S_ISREG(st.st_mode)
@@ -492,6 +624,7 @@ class FileHandler:
 
         mime, _ = mimetypes.guess_type(str(path))
 
+        await self._emit("FILE_STAT", msg.id, details, _ok_result(_elapsed_ms(start)))
         return FileStatResponseMessage(
             id=msg.id,
             ts=now_ts(),
@@ -517,16 +650,30 @@ class FileHandler:
         self, msg: FileListMessage
     ) -> FileListResponseMessage | ErrorMessage:
         payload = msg.payload
+        start = time.monotonic()
         try:
             base = assert_inside_jail(payload.path, self.config.allowed_root)
         except PathJailError as exc:
+            await _audit_jail_violation(self.audit, "FILE_LIST", payload.path, exc)
             return _jail_error_to_message(msg.id, exc)
 
+        details_base = {
+            "path": str(base),
+            "glob": payload.glob,
+            "recursive": payload.recursive,
+            "include_hidden": payload.include_hidden,
+            "max_entries": payload.max_entries,
+        }
+
         if not base.exists():
+            await self._emit("FILE_LIST", msg.id, {**details_base, "entries_returned": 0},
+                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
             return make_error(
                 msg.id, ErrorCode.PATH_NOT_FOUND, f"{base} does not exist"
             )
         if not base.is_dir():
+            await self._emit("FILE_LIST", msg.id, {**details_base, "entries_returned": 0},
+                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
             return make_error(
                 msg.id, ErrorCode.INTERNAL_ERROR, f"{base} is not a directory"
             )
@@ -575,6 +722,12 @@ class FileHandler:
             return entries, truncated
 
         entries, truncated = await asyncio.to_thread(_walk)
+        await self._emit(
+            "FILE_LIST",
+            msg.id,
+            {**details_base, "entries_returned": len(entries)},
+            _ok_result(_elapsed_ms(start)),
+        )
         return FileListResponseMessage(
             id=msg.id,
             ts=now_ts(),
@@ -587,14 +740,25 @@ class FileHandler:
         self, msg: FileDeleteMessage
     ) -> AckMessage | ErrorMessage:
         payload = msg.payload
+        start = time.monotonic()
         try:
             path = assert_inside_jail(payload.path, self.config.allowed_root)
         except PathJailError as exc:
+            await _audit_jail_violation(self.audit, "FILE_DELETE", payload.path, exc)
             return _jail_error_to_message(msg.id, exc)
+
+        details = {
+            "path": str(path),
+            "recursive": payload.recursive,
+            "missing_ok": payload.missing_ok,
+        }
 
         if not path.exists():
             if payload.missing_ok:
+                await self._emit("FILE_DELETE", msg.id, details, _ok_result(_elapsed_ms(start)))
                 return make_ack(msg.id)
+            await self._emit("FILE_DELETE", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
             return make_error(
                 msg.id, ErrorCode.PATH_NOT_FOUND, f"{path} does not exist"
             )
@@ -608,14 +772,21 @@ class FileHandler:
                         await asyncio.to_thread(os.rmdir, str(path))
                     except OSError as exc:
                         # Dir not empty.
+                        await self._emit(
+                            "FILE_DELETE", msg.id, details,
+                            _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_EMPTY.value),
+                        )
                         return make_error(
                             msg.id, ErrorCode.PATH_NOT_EMPTY, str(exc)
                         )
             else:
                 await asyncio.to_thread(os.unlink, str(path))
         except OSError as exc:
+            await self._emit("FILE_DELETE", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
+        await self._emit("FILE_DELETE", msg.id, details, _ok_result(_elapsed_ms(start)))
         return make_ack(msg.id)
 
     # -- FILE_MOVE -----------------------------------------------------------
@@ -624,6 +795,7 @@ class FileHandler:
         self, msg: FileMoveMessage
     ) -> AckMessage | ErrorMessage:
         payload = msg.payload
+        start = time.monotonic()
         try:
             src = assert_inside_jail(payload.src, self.config.allowed_root)
             dst_raw = Path(payload.dst).expanduser()
@@ -634,13 +806,22 @@ class FileHandler:
                 assert_inside_jail(dst_raw.parent, self.config.allowed_root)
                 dst = dst_raw
         except PathJailError as exc:
+            await _audit_jail_violation(
+                self.audit, "FILE_MOVE", f"{payload.src} -> {payload.dst}", exc
+            )
             return _jail_error_to_message(msg.id, exc)
 
+        details = {"src": str(src), "dst": str(dst), "overwrite": payload.overwrite}
+
         if not src.exists():
+            await self._emit("FILE_MOVE", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
             return make_error(
                 msg.id, ErrorCode.PATH_NOT_FOUND, f"{src} does not exist"
             )
         if dst.exists() and not payload.overwrite:
+            await self._emit("FILE_MOVE", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.PATH_EXISTS.value))
             return make_error(
                 msg.id, ErrorCode.PATH_EXISTS, f"{dst} already exists"
             )
@@ -654,17 +835,41 @@ class FileHandler:
             # shutil.move handles cross-device by falling back to copy+delete.
             await asyncio.to_thread(shutil.move, str(src), str(dst))
         except OSError as exc:
+            await self._emit("FILE_MOVE", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
+        await self._emit("FILE_MOVE", msg.id, details, _ok_result(_elapsed_ms(start)))
         return make_ack(msg.id)
+
+    # -- emit helper ---------------------------------------------------------
+
+    async def _emit(
+        self,
+        op: str,
+        request_id: str,
+        details: dict,
+        result: dict,
+    ) -> None:
+        if self.audit is None:
+            return
+        try:
+            await self.audit.write(op, request_id=request_id, details=details, result=result)
+        except Exception:
+            logger.debug("Failed to write %s audit record", op, exc_info=True)
 
 
 # ── Computer use ─────────────────────────────────────────────────────────────
 
 
 class ComputerUseHandler:
-    def __init__(self, config: ShimConfig) -> None:
+    def __init__(
+        self,
+        config: ShimConfig,
+        audit: AuditWriter | None = None,
+    ) -> None:
         self.config = config
+        self.audit = audit
 
     async def handle(self, msg) -> ScreenshotResponseMessage | AckMessage | ErrorMessage:
         if not self.config.enable_computer_use:
@@ -684,7 +889,15 @@ class ComputerUseHandler:
     async def _screenshot(
         self, msg: ScreenshotRequestMessage
     ) -> ScreenshotResponseMessage | ErrorMessage:
+        start = time.monotonic()
+        details_base = {"monitor": msg.payload.monitor, "quality": msg.payload.quality}
+
         if _pyautogui is None or _Image is None:
+            await self._emit(
+                "SCREENSHOT_REQUEST", msg.id,
+                {**details_base, "image_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.DEPENDENCY_MISSING.value),
+            )
             return make_error(
                 msg.id,
                 ErrorCode.DEPENDENCY_MISSING,
@@ -701,8 +914,18 @@ class ComputerUseHandler:
         try:
             img_bytes, w, h = await asyncio.to_thread(_capture)
         except Exception as exc:
+            await self._emit(
+                "SCREENSHOT_REQUEST", msg.id,
+                {**details_base, "image_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
+        await self._emit(
+            "SCREENSHOT_REQUEST", msg.id,
+            {**details_base, "image_bytes_returned": len(img_bytes), "width": w, "height": h},
+            _ok_result(_elapsed_ms(start)),
+        )
         return ScreenshotResponseMessage(
             id=msg.id,
             ts=now_ts(),
@@ -718,12 +941,24 @@ class ComputerUseHandler:
     async def _execute_action(
         self, msg: InputActionMessage
     ) -> AckMessage | ErrorMessage:
+        start = time.monotonic()
+        payload = msg.payload
+        # Per AUDIT_LOG.md "What's NEVER logged": text → length only.
+        details = {
+            "action": payload.action,
+            "coordinate": list(payload.coordinate) if payload.coordinate else None,
+            "key": payload.key,
+            "direction": payload.direction,
+            "clicks": payload.clicks,
+            "text_length": len(payload.text) if payload.text is not None else None,
+        }
+
         if _pyautogui is None:
+            await self._emit("INPUT_ACTION", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.DEPENDENCY_MISSING.value))
             return make_error(
                 msg.id, ErrorCode.DEPENDENCY_MISSING, "pyautogui not installed."
             )
-
-        payload = msg.payload
 
         def _run() -> None:
             _pyautogui.FAILSAFE = True
@@ -755,9 +990,26 @@ class ComputerUseHandler:
         try:
             await asyncio.to_thread(_run)
         except Exception as exc:
+            await self._emit("INPUT_ACTION", msg.id, details,
+                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
+        await self._emit("INPUT_ACTION", msg.id, details, _ok_result(_elapsed_ms(start)))
         return make_ack(msg.id)
+
+    async def _emit(
+        self,
+        op: str,
+        request_id: str,
+        details: dict,
+        result: dict,
+    ) -> None:
+        if self.audit is None:
+            return
+        try:
+            await self.audit.write(op, request_id=request_id, details=details, result=result)
+        except Exception:
+            logger.debug("Failed to write %s audit record", op, exc_info=True)
 
 
 __all__ = [

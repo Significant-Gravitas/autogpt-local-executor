@@ -24,3 +24,25 @@ pipx install autogpt-local-executor
 ```
 
 per `docs/CROSS_PLATFORM.md` "Packaging & install" row.
+
+## Release flow
+
+`.github/workflows/release.yml` handles PyPI publish:
+
+1. Bump `version` in `pyproject.toml` to match the tag you're about to push.
+2. Tag + push: `git tag v0.0.1 && git push --tags`.
+3. The workflow builds sdist + wheel, publishes to PyPI via trusted-publisher
+   OIDC (no `PYPI_API_TOKEN` secret needed — register this repo + the
+   `release` workflow + the `pypi` environment once at
+   https://pypi.org/manage/account/publishing/), and creates a GitHub
+   release with the dists attached.
+4. After release lands, run `scripts/update_packaging.sh v0.0.1` locally
+   to refresh the Homebrew formula + Scoop manifest in this repo with
+   real url+sha256+version. The script fetches the published dists from
+   PyPI, computes SHAs, and edits both files in place.
+5. Copy the rendered files into the tap / bucket repos (paths printed
+   by the script) and open PRs there.
+
+Once a tap / bucket exists and we're publishing regularly, step 4 can be
+moved into a separate workflow that auto-bumps the tap repo via a
+cross-repo PAT. Not worth the complexity for v0.

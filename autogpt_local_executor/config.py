@@ -125,6 +125,20 @@ class ShimConfig(BaseSettings):
 
     # ── Computer use ───────────────────────────────────────────────────────
     max_screenshots_per_minute: int = Field(default=10)
+    enable_clipboard: bool = Field(
+        default=False,
+        description="Allow CLIPBOARD_READ / CLIPBOARD_WRITE. Without this "
+        "flag clipboard sub-ops return FEATURE_NOT_SUPPORTED. See "
+        "docs/COMPUTER_USE.md Q3.",
+    )
+    enable_clipboard_read_foreign: bool = Field(
+        default=False,
+        description="When set together with --enable-clipboard, allow "
+        "CLIPBOARD_READ to return foreign (non-shim-written) contents, "
+        "subject to ConcealedType / CF_PRIVATE checks. Without this, "
+        "CLIPBOARD_READ is writeback-only with a 30s window. See "
+        "docs/COMPUTER_USE.md Q3.",
+    )
 
     @property
     def derived_ws_url(self) -> str:

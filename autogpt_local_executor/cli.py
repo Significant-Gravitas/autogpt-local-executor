@@ -49,9 +49,33 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("auth", help="Authenticate with the AutoGPT platform (OAuth)")
-    sub.add_parser("start", help="Start the shim daemon")
+    start_p = sub.add_parser("start", help="Start the shim daemon")
+    start_p.add_argument(
+        "--enable-computer-use",
+        action="store_true",
+        default=False,
+        help="Advertise the computer_use capability and enable screen + input ops.",
+    )
+    start_p.add_argument(
+        "--enable-clipboard",
+        action="store_true",
+        default=False,
+        help="Permit CLIPBOARD_READ / CLIPBOARD_WRITE (default-deny; see "
+        "docs/COMPUTER_USE.md Q3).",
+    )
+    start_p.add_argument(
+        "--enable-clipboard-read-foreign",
+        action="store_true",
+        default=False,
+        help="With --enable-clipboard, also permit reading clipboard contents "
+        "the shim didn't write (subject to ConcealedType / CF_PRIVATE).",
+    )
     sub.add_parser("status", help="Show connection + autostart status")
     sub.add_parser("revoke", help="Revoke tokens and disconnect")
+    sub.add_parser(
+        "doctor",
+        help="Run preflight checks (allowed_root, keychain, OS permissions, display).",
+    )
     install_p = sub.add_parser(
         "install",
         help="Write a per-OS autostart entry (launchd / systemd / Task Scheduler)",
@@ -116,11 +140,17 @@ def main() -> None:
     if args.command == "auth":
         _cmd_auth(config)
     elif args.command == "start":
-        asyncio.run(_cmd_start(config))
+        exit_code = asyncio.run(_cmd_start(config))
+        if exit_code:
+            sys.exit(exit_code)
     elif args.command == "status":
         _cmd_status(config, args)
     elif args.command == "revoke":
         _cmd_revoke()
+    elif args.command == "doctor":
+        from .doctor import run_doctor
+
+        sys.exit(run_doctor(config))
     elif args.command == "audit":
         exit_code = _cmd_audit(config, args)
         if exit_code:
@@ -138,6 +168,14 @@ def _build_config(args):
         overrides["allowed_root"] = args.allowed_root
     if args.platform_url is not None:
         overrides["platform_url"] = args.platform_url
+    # Subcommand-specific flags (start) — argparse only sets them when
+    # the corresponding subparser ran, so guard with hasattr.
+    if getattr(args, "enable_computer_use", False):
+        overrides["enable_computer_use"] = True
+    if getattr(args, "enable_clipboard", False):
+        overrides["enable_clipboard"] = True
+    if getattr(args, "enable_clipboard_read_foreign", False):
+        overrides["enable_clipboard_read_foreign"] = True
     return load_config(config_path=args.config, overrides=overrides)
 
 
@@ -148,9 +186,9 @@ def _cmd_auth(config) -> None:
     flow.run()
 
 
-async def _cmd_start(config) -> None:
+async def _cmd_start(config) -> int:
     from .auth import KeychainTokenStore
-    from .daemon import ShimDaemon
+    from .daemon import DaemonPreflightError, ShimDaemon
 
     daemon = ShimDaemon(config=config, token_store=KeychainTokenStore())
     print(f"Starting shim daemon (machine_id={config.machine_id})")
@@ -158,9 +196,15 @@ async def _cmd_start(config) -> None:
     print("Press Ctrl+C to stop.\n")
     try:
         await daemon.run()
+    except DaemonPreflightError as exc:
+        # Exit 78 (EX_CONFIG) so launchd's KeepAlive: SuccessfulExit=false
+        # re-launches us on the next TCC change. See COMPUTER_USE.md Q5.
+        print(f"Preflight failed: {exc}", flush=True)
+        return 78
     except KeyboardInterrupt:
         await daemon.stop()
         print("\nShim stopped.")
+    return 0
 
 
 def _cmd_status(config, args) -> None:

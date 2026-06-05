@@ -47,18 +47,25 @@ async def test_screenshot_disabled(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_screenshot_no_pyautogui(tmp_path: Path) -> None:
+async def test_screenshot_no_backend_deps(tmp_path: Path, monkeypatch) -> None:
+    """When mss/Pillow aren't available the backend raises
+    FeatureNotSupportedError → wire FEATURE_NOT_SUPPORTED."""
+    from autogpt_local_executor.computer_use.backends import macos as macos_mod
+    from autogpt_local_executor.computer_use import errors as cu_errors
+
     handler = ComputerUseHandler(make_config(tmp_path, enable=True))
+
+    def _raise(*_, **__):
+        raise cu_errors.FeatureNotSupportedError("screenshot", reason="mss missing")
+
+    monkeypatch.setattr(handler.backend, "screenshot", _raise)
+    # Also silence the legacy back-compat shim that honors a monkeypatched _pyautogui.
     import autogpt_local_executor.handlers as h_mod
 
-    original = h_mod._pyautogui
-    h_mod._pyautogui = None
-    try:
-        resp = await handler.handle(_screenshot_msg())
-    finally:
-        h_mod._pyautogui = original
+    monkeypatch.setattr(h_mod, "_pyautogui", None)
+    resp = await handler.handle(_screenshot_msg())
     assert isinstance(resp, ErrorMessage)
-    assert resp.payload.code == ErrorCode.DEPENDENCY_MISSING
+    assert resp.payload.code == ErrorCode.FEATURE_NOT_SUPPORTED
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,12 @@ from .auth import KeychainTokenStore
 from .config import ShimConfig
 from .handlers import CommandHandler, ComputerUseHandler, FileHandler
 from .protocol import (
+    AppLaunchMessage,
+    AppListRequestMessage,
+    ClipboardReadMessage,
+    ClipboardWriteMessage,
+    CursorPositionRequestMessage,
+    DisplayInfoRequestMessage,
     ErrorCode,
     ExecuteCommandMessage,
     FileDeleteMessage,
@@ -40,8 +46,11 @@ from .protocol import (
     HelloPayload,
     InputActionMessage,
     Message,
+    PermissionsCheckRequestMessage,
     PingMessage,
     ScreenshotRequestMessage,
+    WindowFocusMessage,
+    WindowListRequestMessage,
     dump_message,
     make_error,
     make_pong,
@@ -49,6 +58,17 @@ from .protocol import (
     now_ts,
     parse_message,
 )
+
+
+class DaemonPreflightError(RuntimeError):
+    """Raised when daemon refuses to bind due to a missing OS permission.
+
+    Per docs/COMPUTER_USE.md Q5: when computer_use is requested but
+    AXIsProcessTrusted() returns false (macOS), the daemon emits a
+    clear audit record and exits with EX_CONFIG (78). launchd's
+    KeepAlive: SuccessfulExit=false re-launches us on the next TCC
+    change.
+    """
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +123,10 @@ class ShimDaemon:
         reconnect on any failure.
         """
         self._running = True
+        # Preflight: per Q5, refuse to bind if computer-use is requested
+        # but OS permissions are missing. We do this BEFORE shim_start
+        # audit so the audit log carries the failure record cleanly.
+        self._preflight_or_raise()
         await self._audit_shim_start()
         attempt = 0
         try:
@@ -250,6 +274,12 @@ class ShimDaemon:
     # ── Handshake ─────────────────────────────────────────────────────────
 
     async def _handshake(self, ws) -> HelloAckMessage:
+        # Per COMPUTER_USE.md Q2: every HELLO wipes window IDs.
+        if self.config.enable_computer_use:
+            try:
+                self._computer_handler.on_hello()
+            except Exception:
+                logger.debug("computer-use on_hello failed", exc_info=True)
         hello = self._build_hello()
         await ws.send(dump_message(hello))
         raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
@@ -290,6 +320,14 @@ class ShimDaemon:
             enable_hardware=cfg.enable_hardware,
         )
         screen = platform_info.detect_screen_resolution()
+        cu_features: list[str] = []
+        cu_features_coarse: list[str] = []
+        if "computer_use" in caps:
+            try:
+                cu_features = list(self._computer_handler.backend.features())
+                cu_features_coarse = list(self._computer_handler.backend.coarse_features())
+            except Exception:
+                logger.debug("computer-use feature probe failed", exc_info=True)
         payload = HelloPayload(
             shim_version=__import__("autogpt_local_executor").__version__,
             machine_id=cfg.machine_id,
@@ -300,6 +338,8 @@ class ShimDaemon:
             allowed_root=str(cfg.allowed_root),
             local_llm_models=[],
             hardware_devices=[],
+            computer_use_features=cu_features,
+            computer_use_features_coarse=cu_features_coarse,
         )
         return HelloMessage(id=new_id(), ts=now_ts(), payload=payload)
 
@@ -345,6 +385,20 @@ class ShimDaemon:
         except Exception:
             logger.debug("Failed to send response", exc_info=True)
 
+    _COMPUTER_USE_MESSAGE_TYPES = (
+        ScreenshotRequestMessage,
+        InputActionMessage,
+        CursorPositionRequestMessage,
+        DisplayInfoRequestMessage,
+        WindowListRequestMessage,
+        WindowFocusMessage,
+        AppListRequestMessage,
+        AppLaunchMessage,
+        ClipboardReadMessage,
+        ClipboardWriteMessage,
+        PermissionsCheckRequestMessage,
+    )
+
     async def _handle(self, msg: Any) -> BaseModel | None:
         if isinstance(msg, ExecuteCommandMessage):
             return await self._command_handler.handle(msg)
@@ -360,11 +414,70 @@ class ShimDaemon:
             return await self._file_handler.handle_delete(msg)
         if isinstance(msg, FileMoveMessage):
             return await self._file_handler.handle_move(msg)
-        if isinstance(msg, (ScreenshotRequestMessage, InputActionMessage)):
+        if isinstance(msg, self._COMPUTER_USE_MESSAGE_TYPES):
             return await self._computer_handler.handle(msg)
         # Anything else (e.g., responses we didn't ask for) is silently dropped.
         logger.debug("No handler for %s; dropping", type(msg).__name__)
         return None
+
+    # ── Preflight ────────────────────────────────────────────────────
+
+    def _preflight_or_raise(self) -> None:
+        """Per COMPUTER_USE.md Q5: when computer_use is requested but the
+        required OS permission isn't granted, write a structured audit
+        record and raise DaemonPreflightError so the CLI exits 78.
+        """
+        if not self.config.enable_computer_use:
+            return
+        plat = platform_info.detect_platform()
+        if plat != "darwin":
+            return
+        try:
+            from ApplicationServices import (  # type: ignore[import-not-found]
+                AXIsProcessTrusted,
+            )
+        except ImportError:
+            # No pyobjc — can't check. Treat as a warning, not a fail.
+            logger.warning(
+                "Cannot probe Accessibility: pyobjc/ApplicationServices not installed."
+            )
+            return
+        try:
+            trusted = bool(AXIsProcessTrusted())
+        except Exception as exc:
+            logger.warning("AXIsProcessTrusted() failed: %s", exc)
+            return
+        if trusted:
+            return
+        # Refuse to bind. Emit a synthetic audit entry so the user has
+        # a record of the refusal.
+        if self.audit is not None:
+            try:
+                # Use the existing write helper with a synthetic op name.
+                # We don't await here from a sync method; just queue best-effort.
+                asyncio.get_event_loop().create_task(
+                    self.audit.write(
+                        "DAEMON_PREFLIGHT_FAILED",
+                        request_id=new_id(),
+                        details={
+                            "missing_permissions": ["accessibility"],
+                            "platform": plat,
+                            "hint": "Run `autogpt-shim doctor` and grant access.",
+                        },
+                        result={
+                            "ok": False,
+                            "exit_code": 78,
+                            "duration_ms": 0,
+                            "error_code": ErrorCode.PERMISSION_PENDING.value,
+                        },
+                    )
+                )
+            except Exception:
+                logger.debug("preflight audit emit failed", exc_info=True)
+        raise DaemonPreflightError(
+            "Accessibility permission not granted; computer_use requires it. "
+            "Run `autogpt-shim doctor` to surface the prompt."
+        )
 
 
 __all__ = ["ShimDaemon"]

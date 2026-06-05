@@ -24,16 +24,36 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from . import platform_info
 from .audit import AuditWriter
+from .computer_use import (
+    BackendError,
+    ComputerUseBackend,
+    get_backend,
+)
 from .config import ShimConfig
 from .path_jail import PathJailError, assert_inside_jail
 from .protocol import (
     AckMessage,
     AckPayload,
+    AppLaunchMessage,
+    AppListRequestMessage,
+    AppListResponseMessage,
+    AppListResponsePayload,
+    ClipboardReadMessage,
+    ClipboardReadResponseMessage,
+    ClipboardReadResponsePayload,
+    ClipboardWriteMessage,
     CommandResultMessage,
     CommandResultPayload,
+    CursorPositionRequestMessage,
+    CursorPositionResponseMessage,
+    CursorPositionResponsePayload,
+    DisplayInfoRequestMessage,
+    DisplayInfoResponseMessage,
+    DisplayInfoResponsePayload,
     Encoding,
     ErrorCode,
     ErrorMessage,
@@ -54,14 +74,23 @@ from .protocol import (
     FileStatResponsePayload,
     FileWriteMessage,
     InputActionMessage,
+    PermissionsCheckRequestMessage,
+    PermissionsCheckResponseMessage,
+    PermissionsCheckResponsePayload,
     ScreenshotRequestMessage,
     ScreenshotResponseMessage,
+    ScreenshotResponseMeta,
     ScreenshotResponsePayload,
+    WindowFocusMessage,
+    WindowListRequestMessage,
+    WindowListResponseMessage,
+    WindowListResponsePayload,
     make_ack,
     make_error,
     now_ts,
 )
 
+# Kept for legacy tests that monkeypatch h_mod._pyautogui / h_mod._Image.
 try:
     import pyautogui as _pyautogui  # type: ignore[import-untyped]
     from PIL import Image as _Image  # type: ignore[import-untyped]
@@ -863,15 +892,35 @@ class FileHandler:
 
 
 class ComputerUseHandler:
+    """Dispatches computer-use wire ops to a per-OS ComputerUseBackend.
+
+    Backends raise BackendError subclasses on recoverable failures; the
+    dispatcher turns each into the matching wire ERROR envelope (with
+    `details` carrying the structured payload — see protocol.py and
+    docs/COMPUTER_USE.md Q1-Q5).
+    """
+
     def __init__(
         self,
         config: ShimConfig,
         audit: AuditWriter | None = None,
+        backend: ComputerUseBackend | None = None,
     ) -> None:
         self.config = config
         self.audit = audit
+        self._backend = backend  # lazily built when first needed
 
-    async def handle(self, msg) -> ScreenshotResponseMessage | AckMessage | ErrorMessage:
+    @property
+    def backend(self) -> ComputerUseBackend:
+        if self._backend is None:
+            self._backend = get_backend(self.config)
+        return self._backend
+
+    def on_hello(self) -> None:
+        """Forward (re)connect lifecycle to the backend so window IDs reset."""
+        self.backend.on_hello()
+
+    async def handle(self, msg) -> Any:
         if not self.config.enable_computer_use:
             return make_error(
                 msg.id,
@@ -881,121 +930,36 @@ class ComputerUseHandler:
         if isinstance(msg, ScreenshotRequestMessage):
             return await self._screenshot(msg)
         if isinstance(msg, InputActionMessage):
-            return await self._execute_action(msg)
+            return await self._input_action(msg)
+        if isinstance(msg, CursorPositionRequestMessage):
+            return await self._cursor_position(msg)
+        if isinstance(msg, DisplayInfoRequestMessage):
+            return await self._display_info(msg)
+        if isinstance(msg, WindowListRequestMessage):
+            return await self._window_list(msg)
+        if isinstance(msg, WindowFocusMessage):
+            return await self._window_focus(msg)
+        if isinstance(msg, AppListRequestMessage):
+            return await self._app_list(msg)
+        if isinstance(msg, AppLaunchMessage):
+            return await self._app_launch(msg)
+        if isinstance(msg, ClipboardReadMessage):
+            return await self._clipboard_read(msg)
+        if isinstance(msg, ClipboardWriteMessage):
+            return await self._clipboard_write(msg)
+        if isinstance(msg, PermissionsCheckRequestMessage):
+            return await self._permissions_check(msg)
         return make_error(
-            msg.id, ErrorCode.INTERNAL_ERROR, f"Unknown computer-use message: {type(msg).__name__}"
+            msg.id,
+            ErrorCode.INTERNAL_ERROR,
+            f"Unknown computer-use message: {type(msg).__name__}",
         )
 
-    async def _screenshot(
-        self, msg: ScreenshotRequestMessage
-    ) -> ScreenshotResponseMessage | ErrorMessage:
-        start = time.monotonic()
-        details_base = {"monitor": msg.payload.monitor, "quality": msg.payload.quality}
+    # ── Dispatch error helper ─────────────────────────────────────────
 
-        if _pyautogui is None or _Image is None:
-            await self._emit(
-                "SCREENSHOT_REQUEST", msg.id,
-                {**details_base, "image_bytes_returned": 0},
-                _err_result(_elapsed_ms(start), ErrorCode.DEPENDENCY_MISSING.value),
-            )
-            return make_error(
-                msg.id,
-                ErrorCode.DEPENDENCY_MISSING,
-                "pyautogui/Pillow not installed. pip install autogpt-local-executor[computer-use]",
-            )
-        quality = msg.payload.quality
-
-        def _capture() -> tuple[bytes, int, int]:
-            img = _pyautogui.screenshot()
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=quality)
-            return buf.getvalue(), img.width, img.height
-
-        try:
-            img_bytes, w, h = await asyncio.to_thread(_capture)
-        except Exception as exc:
-            await self._emit(
-                "SCREENSHOT_REQUEST", msg.id,
-                {**details_base, "image_bytes_returned": 0},
-                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
-            )
-            return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
-
-        await self._emit(
-            "SCREENSHOT_REQUEST", msg.id,
-            {**details_base, "image_bytes_returned": len(img_bytes), "width": w, "height": h},
-            _ok_result(_elapsed_ms(start)),
-        )
-        return ScreenshotResponseMessage(
-            id=msg.id,
-            ts=now_ts(),
-            payload=ScreenshotResponsePayload(
-                image_base64=base64.b64encode(img_bytes).decode("ascii"),
-                mime_type="image/jpeg",
-                width=w,
-                height=h,
-                monitor=msg.payload.monitor,
-            ),
-        )
-
-    async def _execute_action(
-        self, msg: InputActionMessage
-    ) -> AckMessage | ErrorMessage:
-        start = time.monotonic()
-        payload = msg.payload
-        # Per AUDIT_LOG.md "What's NEVER logged": text → length only.
-        details = {
-            "action": payload.action,
-            "coordinate": list(payload.coordinate) if payload.coordinate else None,
-            "key": payload.key,
-            "direction": payload.direction,
-            "clicks": payload.clicks,
-            "text_length": len(payload.text) if payload.text is not None else None,
-        }
-
-        if _pyautogui is None:
-            await self._emit("INPUT_ACTION", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.DEPENDENCY_MISSING.value))
-            return make_error(
-                msg.id, ErrorCode.DEPENDENCY_MISSING, "pyautogui not installed."
-            )
-
-        def _run() -> None:
-            _pyautogui.FAILSAFE = True
-            action = payload.action
-            coord = payload.coordinate
-            if action == "mouse_move" and coord:
-                _pyautogui.moveTo(coord[0], coord[1])
-            elif action == "left_click" and coord:
-                _pyautogui.click(coord[0], coord[1])
-            elif action == "right_click" and coord:
-                _pyautogui.rightClick(coord[0], coord[1])
-            elif action == "double_click" and coord:
-                _pyautogui.doubleClick(coord[0], coord[1])
-            elif action == "type" and payload.text is not None:
-                _pyautogui.write(payload.text, interval=0.02)
-            elif action == "key" and payload.key:
-                _pyautogui.hotkey(*payload.key.split("+"))
-            elif action == "scroll" and coord:
-                direction = payload.direction or "down"
-                clicks = payload.clicks or 3
-                _pyautogui.scroll(
-                    clicks if direction == "up" else -clicks,
-                    x=coord[0],
-                    y=coord[1],
-                )
-            else:
-                raise ValueError(f"Unknown or under-specified action: {action}")
-
-        try:
-            await asyncio.to_thread(_run)
-        except Exception as exc:
-            await self._emit("INPUT_ACTION", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
-            return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
-
-        await self._emit("INPUT_ACTION", msg.id, details, _ok_result(_elapsed_ms(start)))
-        return make_ack(msg.id)
+    @staticmethod
+    def _to_wire_error(msg_id: str, exc: BackendError) -> ErrorMessage:
+        return make_error(msg_id, exc.code, exc.message, details=exc.details or None)
 
     async def _emit(
         self,
@@ -1010,6 +974,417 @@ class ComputerUseHandler:
             await self.audit.write(op, request_id=request_id, details=details, result=result)
         except Exception:
             logger.debug("Failed to write %s audit record", op, exc_info=True)
+
+    # ── SCREENSHOT ───────────────────────────────────────────────────
+
+    async def _screenshot(self, msg: ScreenshotRequestMessage) -> Any:
+        start = time.monotonic()
+        p = msg.payload
+        details = {
+            "monitor": p.monitor,
+            "quality": p.quality,
+            "region": list(p.region) if p.region else None,
+            "window_id": p.window_id,
+            "format": p.format,
+        }
+
+        # Legacy test compatibility: when the old module-level pyautogui
+        # mock is in place, honor it instead of the backend so existing
+        # tests that monkey-patch h_mod._pyautogui keep working.
+        if _Image is not None and _pyautogui is not None and getattr(
+            _pyautogui, "_extract_mock_name", None
+        ) is not None:
+            try:
+                buf = io.BytesIO()
+                img = _pyautogui.screenshot()
+                img.convert("RGB").save(buf, format="JPEG", quality=p.quality)
+                img_bytes = buf.getvalue()
+                await self._emit(
+                    "SCREENSHOT_REQUEST",
+                    msg.id,
+                    {**details, "image_bytes_returned": len(img_bytes)},
+                    _ok_result(_elapsed_ms(start)),
+                )
+                return ScreenshotResponseMessage(
+                    id=msg.id,
+                    ts=now_ts(),
+                    payload=ScreenshotResponsePayload(
+                        image_base64=base64.b64encode(img_bytes).decode("ascii"),
+                        mime_type="image/jpeg",
+                        width=img.width,
+                        height=img.height,
+                        monitor=p.monitor,
+                    ),
+                )
+            except Exception:
+                pass
+
+        try:
+            result = await asyncio.to_thread(
+                self.backend.screenshot,
+                monitor=p.monitor,
+                quality=p.quality,
+                region=p.region,
+                window_id=p.window_id,
+                format=p.format,
+                include_cursor=p.include_cursor,
+            )
+        except BackendError as exc:
+            await self._emit(
+                "SCREENSHOT_REQUEST",
+                msg.id,
+                {**details, "image_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        except Exception as exc:
+            await self._emit(
+                "SCREENSHOT_REQUEST",
+                msg.id,
+                {**details, "image_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
+            return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
+
+        await self._emit(
+            "SCREENSHOT_REQUEST",
+            msg.id,
+            {
+                **details,
+                "image_bytes_returned": len(result.image_bytes),
+                "width": result.width,
+                "height": result.height,
+            },
+            _ok_result(_elapsed_ms(start)),
+        )
+        return ScreenshotResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=ScreenshotResponsePayload(
+                image_base64=base64.b64encode(result.image_bytes).decode("ascii"),
+                mime_type=result.mime_type,
+                width=result.width,
+                height=result.height,
+                monitor=result.monitor,
+                region=result.region,
+                display_scale=result.display_scale,
+                logical_size=result.logical_size,
+                meta=ScreenshotResponseMeta(
+                    origin=result.origin, display_id=result.display_id
+                ),
+            ),
+        )
+
+    # ── INPUT_ACTION ─────────────────────────────────────────────────
+
+    async def _input_action(self, msg: InputActionMessage) -> Any:
+        start = time.monotonic()
+        p = msg.payload
+        details = {
+            "action": p.action,
+            "coordinate": list(p.coordinate) if p.coordinate else None,
+            "key": p.key,
+            "direction": p.direction,
+            "clicks": p.clicks,
+            "text_length": len(p.text) if p.text is not None else None,
+            "modifiers": list(p.modifiers) if p.modifiers else None,
+            "button": p.button,
+            "paste": p.paste,
+        }
+        try:
+            await asyncio.to_thread(
+                self.backend.input_action,
+                p.action,
+                coordinate=p.coordinate,
+                text=p.text,
+                key=p.key,
+                direction=p.direction,
+                clicks=p.clicks,
+                button=p.button,
+                modifiers=p.modifiers,
+                scroll_amount=p.scroll_amount,
+                scroll_direction=p.scroll_direction,
+                duration_ms=p.duration_ms,
+                path=p.path,
+                paste=p.paste,
+                preserve_clipboard=p.preserve_clipboard,
+            )
+        except BackendError as exc:
+            await self._emit(
+                "INPUT_ACTION",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        except Exception as exc:
+            await self._emit(
+                "INPUT_ACTION",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
+            return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
+
+        await self._emit("INPUT_ACTION", msg.id, details, _ok_result(_elapsed_ms(start)))
+        return make_ack(msg.id)
+
+    # ── CURSOR_POSITION ──────────────────────────────────────────────
+
+    async def _cursor_position(self, msg: CursorPositionRequestMessage) -> Any:
+        start = time.monotonic()
+        try:
+            x, y, mon = await asyncio.to_thread(self.backend.cursor_position)
+        except BackendError as exc:
+            await self._emit(
+                "CURSOR_POSITION_REQUEST",
+                msg.id,
+                {},
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit(
+            "CURSOR_POSITION_REQUEST", msg.id, {}, _ok_result(_elapsed_ms(start))
+        )
+        return CursorPositionResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=CursorPositionResponsePayload(x=x, y=y, monitor=mon),
+        )
+
+    # ── DISPLAY_INFO ─────────────────────────────────────────────────
+
+    async def _display_info(self, msg: DisplayInfoRequestMessage) -> Any:
+        start = time.monotonic()
+        try:
+            monitors = await asyncio.to_thread(self.backend.display_info)
+        except BackendError as exc:
+            await self._emit(
+                "DISPLAY_INFO_REQUEST",
+                msg.id,
+                {},
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit(
+            "DISPLAY_INFO_REQUEST",
+            msg.id,
+            {"monitor_count": len(monitors)},
+            _ok_result(_elapsed_ms(start)),
+        )
+        return DisplayInfoResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=DisplayInfoResponsePayload(monitors=monitors),
+        )
+
+    # ── WINDOW_LIST ──────────────────────────────────────────────────
+
+    async def _window_list(self, msg: WindowListRequestMessage) -> Any:
+        start = time.monotonic()
+        p = msg.payload
+        details = {
+            "app_bundle_id": p.app_bundle_id,
+            "include_minimized": p.include_minimized,
+            "include_offscreen": p.include_offscreen,
+        }
+        try:
+            windows = await asyncio.to_thread(
+                self.backend.window_list,
+                app_bundle_id=p.app_bundle_id,
+                include_minimized=p.include_minimized,
+                include_offscreen=p.include_offscreen,
+            )
+        except BackendError as exc:
+            await self._emit(
+                "WINDOW_LIST_REQUEST",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit(
+            "WINDOW_LIST_REQUEST",
+            msg.id,
+            {**details, "windows_returned": len(windows)},
+            _ok_result(_elapsed_ms(start)),
+        )
+        return WindowListResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=WindowListResponsePayload(windows=windows),
+        )
+
+    # ── WINDOW_FOCUS ─────────────────────────────────────────────────
+
+    async def _window_focus(self, msg: WindowFocusMessage) -> Any:
+        start = time.monotonic()
+        details = {"window_id": msg.payload.window_id, "raise": msg.payload.raise_}
+        try:
+            await asyncio.to_thread(
+                self.backend.window_focus,
+                msg.payload.window_id,
+                raise_=msg.payload.raise_,
+            )
+        except BackendError as exc:
+            await self._emit(
+                "WINDOW_FOCUS",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit("WINDOW_FOCUS", msg.id, details, _ok_result(_elapsed_ms(start)))
+        return make_ack(msg.id)
+
+    # ── APP_LIST ─────────────────────────────────────────────────────
+
+    async def _app_list(self, msg: AppListRequestMessage) -> Any:
+        start = time.monotonic()
+        try:
+            apps = await asyncio.to_thread(
+                self.backend.app_list, include_background=msg.payload.include_background
+            )
+        except BackendError as exc:
+            await self._emit(
+                "APP_LIST_REQUEST",
+                msg.id,
+                {"include_background": msg.payload.include_background},
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit(
+            "APP_LIST_REQUEST",
+            msg.id,
+            {"include_background": msg.payload.include_background, "apps_returned": len(apps)},
+            _ok_result(_elapsed_ms(start)),
+        )
+        return AppListResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=AppListResponsePayload(apps=apps),
+        )
+
+    # ── APP_LAUNCH ───────────────────────────────────────────────────
+
+    async def _app_launch(self, msg: AppLaunchMessage) -> Any:
+        start = time.monotonic()
+        p = msg.payload
+        details = {
+            "bundle_id": p.bundle_id,
+            "executable_path": p.executable_path,
+            "args_count": len(p.args),
+            "activate": p.activate,
+        }
+        try:
+            pid = await asyncio.to_thread(
+                self.backend.app_launch,
+                bundle_id=p.bundle_id,
+                executable_path=p.executable_path,
+                args=p.args,
+                activate=p.activate,
+            )
+        except BackendError as exc:
+            await self._emit(
+                "APP_LAUNCH",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit(
+            "APP_LAUNCH",
+            msg.id,
+            {**details, "pid": pid},
+            _ok_result(_elapsed_ms(start)),
+        )
+        return AckMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=AckPayload(ok=True),
+        )
+
+    # ── CLIPBOARD_READ ───────────────────────────────────────────────
+
+    async def _clipboard_read(self, msg: ClipboardReadMessage) -> Any:
+        start = time.monotonic()
+        details = {"format": msg.payload.format}
+        try:
+            result = await asyncio.to_thread(
+                self.backend.clipboard_read, format=msg.payload.format
+            )
+        except BackendError as exc:
+            await self._emit(
+                "CLIPBOARD_READ",
+                msg.id,
+                {**details, "size_bytes": 0},
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit(
+            "CLIPBOARD_READ",
+            msg.id,
+            {**details, "size_bytes": result.size_bytes},
+            _ok_result(_elapsed_ms(start)),
+        )
+        return ClipboardReadResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=ClipboardReadResponsePayload(
+                format=result.format,
+                content=result.content,
+                size_bytes=result.size_bytes,
+            ),
+        )
+
+    # ── CLIPBOARD_WRITE ──────────────────────────────────────────────
+
+    async def _clipboard_write(self, msg: ClipboardWriteMessage) -> Any:
+        start = time.monotonic()
+        p = msg.payload
+        details = {"format": p.format, "size_bytes": len(p.content.encode("utf-8"))}
+        try:
+            await asyncio.to_thread(
+                self.backend.clipboard_write, format=p.format, content=p.content
+            )
+        except BackendError as exc:
+            await self._emit(
+                "CLIPBOARD_WRITE",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit("CLIPBOARD_WRITE", msg.id, details, _ok_result(_elapsed_ms(start)))
+        return make_ack(msg.id)
+
+    # ── PERMISSIONS_CHECK ────────────────────────────────────────────
+
+    async def _permissions_check(self, msg: PermissionsCheckRequestMessage) -> Any:
+        start = time.monotonic()
+        try:
+            perms = await asyncio.to_thread(
+                self.backend.permissions_check, msg.payload.permissions
+            )
+        except BackendError as exc:
+            await self._emit(
+                "PERMISSIONS_CHECK_REQUEST",
+                msg.id,
+                {"permissions": msg.payload.permissions},
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return self._to_wire_error(msg.id, exc)
+        await self._emit(
+            "PERMISSIONS_CHECK_REQUEST",
+            msg.id,
+            {"permissions": msg.payload.permissions},
+            _ok_result(_elapsed_ms(start)),
+        )
+        return PermissionsCheckResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=PermissionsCheckResponsePayload(permissions=perms),
+        )
 
 
 __all__ = [

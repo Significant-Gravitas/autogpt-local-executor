@@ -16,10 +16,9 @@ import json
 import time
 import uuid
 from enum import Enum
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
-
 
 # ── Enums ────────────────────────────────────────────────────────────────────
 
@@ -624,43 +623,7 @@ class PongMessage(_Envelope):
 
 # Discriminated union — used when parsing inbound frames.
 Message = Annotated[
-    Union[
-        HelloMessage,
-        HelloAckMessage,
-        ExecuteCommandMessage,
-        CommandResultMessage,
-        FileReadMessage,
-        FileContentsMessage,
-        FileWriteMessage,
-        AckMessage,
-        FileStatMessage,
-        FileStatResponseMessage,
-        FileListMessage,
-        FileListResponseMessage,
-        FileDeleteMessage,
-        FileMoveMessage,
-        ScreenshotRequestMessage,
-        ScreenshotResponseMessage,
-        InputActionMessage,
-        CursorPositionRequestMessage,
-        CursorPositionResponseMessage,
-        DisplayInfoRequestMessage,
-        DisplayInfoResponseMessage,
-        WindowListRequestMessage,
-        WindowListResponseMessage,
-        WindowFocusMessage,
-        AppListRequestMessage,
-        AppListResponseMessage,
-        AppLaunchMessage,
-        ClipboardReadMessage,
-        ClipboardReadResponseMessage,
-        ClipboardWriteMessage,
-        PermissionsCheckRequestMessage,
-        PermissionsCheckResponseMessage,
-        ErrorMessage,
-        PingMessage,
-        PongMessage,
-    ],
+    HelloMessage | HelloAckMessage | ExecuteCommandMessage | CommandResultMessage | FileReadMessage | FileContentsMessage | FileWriteMessage | AckMessage | FileStatMessage | FileStatResponseMessage | FileListMessage | FileListResponseMessage | FileDeleteMessage | FileMoveMessage | ScreenshotRequestMessage | ScreenshotResponseMessage | InputActionMessage | CursorPositionRequestMessage | CursorPositionResponseMessage | DisplayInfoRequestMessage | DisplayInfoResponseMessage | WindowListRequestMessage | WindowListResponseMessage | WindowFocusMessage | AppListRequestMessage | AppListResponseMessage | AppLaunchMessage | ClipboardReadMessage | ClipboardReadResponseMessage | ClipboardWriteMessage | PermissionsCheckRequestMessage | PermissionsCheckResponseMessage | ErrorMessage | PingMessage | PongMessage,
     Field(discriminator="type"),
 ]
 

@@ -217,7 +217,7 @@ class NullBackend(ComputerUseBackend):
     def features(self) -> list[str]:
         return []
 
-    def _refuse(self, feature: str) -> "Any":
+    def _refuse(self, feature: str) -> Any:
         from .errors import FeatureNotSupportedError
 
         raise FeatureNotSupportedError(feature, reason="no display reachable")

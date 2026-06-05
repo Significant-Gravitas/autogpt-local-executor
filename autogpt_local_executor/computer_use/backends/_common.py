@@ -8,7 +8,6 @@ import base64
 import io
 from typing import Any
 
-
 PASTE_THRESHOLD_CHARS = 200  # Q4 — paste:true only honored when text >= 200 chars.
 
 

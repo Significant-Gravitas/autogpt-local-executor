@@ -50,7 +50,6 @@ async def test_screenshot_disabled(tmp_path: Path) -> None:
 async def test_screenshot_no_backend_deps(tmp_path: Path, monkeypatch) -> None:
     """When mss/Pillow aren't available the backend raises
     FeatureNotSupportedError → wire FEATURE_NOT_SUPPORTED."""
-    from autogpt_local_executor.computer_use.backends import macos as macos_mod
     from autogpt_local_executor.computer_use import errors as cu_errors
 
     handler = ComputerUseHandler(make_config(tmp_path, enable=True))

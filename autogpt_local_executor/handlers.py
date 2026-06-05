@@ -57,7 +57,6 @@ from .protocol import (
     Encoding,
     ErrorCode,
     ErrorMessage,
-    ErrorPayload,
     ExecuteCommandMessage,
     FileContentsMessage,
     FileContentsPayload,
@@ -298,7 +297,7 @@ class CommandHandler:
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             exit_code = proc.returncode if proc.returncode is not None else -1
-        except asyncio.TimeoutError:
+        except TimeoutError:
             timed_out = True
             await self._terminate_tree(proc)
             try:
@@ -306,7 +305,7 @@ class CommandHandler:
                 stdout_b, stderr_b = await asyncio.wait_for(
                     proc.communicate(), timeout=2.0
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             exit_code = proc.returncode if proc.returncode is not None else -1
 

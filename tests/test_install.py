@@ -17,7 +17,6 @@ import pytest
 
 from autogpt_local_executor import install as install_mod
 
-
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 

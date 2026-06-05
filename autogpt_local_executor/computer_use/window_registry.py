@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,7 @@ class WindowFingerprint:
     class_name: str | None
     creation_timestamp: float | None
 
-    def matches(self, other: "WindowFingerprint") -> bool:
+    def matches(self, other: WindowFingerprint) -> bool:
         # All three fields must match. None on either side is considered a
         # "couldn't read" — we don't try to be clever and treat it as a match.
         return (

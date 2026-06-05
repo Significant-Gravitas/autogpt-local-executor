@@ -23,7 +23,6 @@ from typing import Any
 from ...config import ShimConfig
 from ...protocol import AppInfo, DisplayMonitor, WindowInfo
 from ..backend import ClipboardReadResult, ComputerUseBackend, ScreenshotResult
-from ..clipboard import WRITEBACK_WINDOW_SECONDS
 from ..display import displays_to_bounds_list, displays_via_mss
 from ..errors import (
     ClipboardConcealedError,
@@ -34,12 +33,10 @@ from ..errors import (
 from ..window_registry import WindowFingerprint
 from ._common import (
     PASTE_THRESHOLD_CHARS,
-    encode_b64,
     image_to_base64,
     in_any_rect,
     normalize_displays_for_error,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +190,8 @@ class MacOSBackend(ComputerUseBackend):
         the per-OS cursor-image fetch dance.
         """
         try:
-            from Quartz import NSEvent  # type: ignore[import-not-found]
             from PIL import ImageDraw  # type: ignore[import-untyped]
+            from Quartz import NSEvent  # type: ignore[import-not-found]
         except ImportError:
             return
         try:
@@ -246,14 +243,13 @@ class MacOSBackend(ComputerUseBackend):
         include_cursor: bool,
     ) -> ScreenshotResult:
         try:
+            from PIL import Image  # type: ignore[import-untyped]
             from Quartz import (  # type: ignore[import-not-found]
-                CGRectMake,
                 CGRectNull,
                 CGWindowListCreateImage,
                 kCGWindowImageDefault,
                 kCGWindowListOptionIncludingWindow,
             )
-            from PIL import Image  # type: ignore[import-untyped]
         except ImportError as exc:
             raise FeatureNotSupportedError("screenshot.window", reason=str(exc)) from exc
 
@@ -269,17 +265,9 @@ class MacOSBackend(ComputerUseBackend):
                 "darwin",
                 hint="Window capture failed; grant Screen Recording in System Settings.",
             )
-        # Convert CGImage → PIL via temporary PNG.
-        try:
-            from CoreGraphics import (  # type: ignore[import-not-found]
-                CGImageGetHeight,
-                CGImageGetWidth,
-            )
-        except ImportError:
-            CGImageGetWidth = CGImageGetHeight = None  # type: ignore[assignment]
-        # NB: a robust conversion uses CGDataProvider; we use a pragmatic
-        # png round-trip via Cocoa NSBitmapImageRep which is simpler and
-        # ships in pyobjc.
+        # Convert CGImage → PIL via a pragmatic png round-trip through
+        # Cocoa NSBitmapImageRep (ships in pyobjc; simpler than the
+        # CGDataProvider dance).
         try:
             from Cocoa import (  # type: ignore[import-not-found]
                 NSBitmapImageRep,
@@ -599,7 +587,6 @@ class MacOSBackend(ComputerUseBackend):
         try:
             from Quartz import (  # type: ignore[import-not-found]
                 CGWindowListCopyWindowInfo,
-                kCGNullWindowID,
                 kCGWindowListOptionIncludingWindow,
             )
 
@@ -783,7 +770,7 @@ class MacOSBackend(ComputerUseBackend):
             if snap is None:
                 raise ClipboardConcealedError("writeback_only")
             age = snap.age()
-            if age > WRITEBACK_WINDOW_SECONDS:
+            if age > self.clipboard_writeback.window_seconds:
                 raise ClipboardConcealedError(
                     "writeback_only", writeback_age_seconds=age
                 )

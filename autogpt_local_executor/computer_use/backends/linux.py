@@ -29,7 +29,6 @@ from typing import Any
 from ...config import ShimConfig
 from ...protocol import AppInfo, DisplayMonitor, WindowInfo
 from ..backend import ClipboardReadResult, ComputerUseBackend, ScreenshotResult
-from ..clipboard import WRITEBACK_WINDOW_SECONDS
 from ..display import displays_to_bounds_list, displays_via_mss
 from ..errors import (
     ClipboardConcealedError,
@@ -43,7 +42,6 @@ from ._common import (
     in_any_rect,
     normalize_displays_for_error,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -522,7 +520,7 @@ class LinuxBackend(ComputerUseBackend):
             if snap is None:
                 raise ClipboardConcealedError("writeback_only")
             age = snap.age()
-            if age > WRITEBACK_WINDOW_SECONDS:
+            if age > self.clipboard_writeback.window_seconds:
                 raise ClipboardConcealedError(
                     "writeback_only", writeback_age_seconds=age
                 )

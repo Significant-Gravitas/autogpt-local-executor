@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from pathlib import Path, PurePath, PureWindowsPath
+from pathlib import Path, PurePath
 
 from .platform_info import detect_platform, is_case_insensitive_fs
 

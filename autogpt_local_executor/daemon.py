@@ -45,7 +45,6 @@ from .protocol import (
     HelloMessage,
     HelloPayload,
     InputActionMessage,
-    Message,
     PermissionsCheckRequestMessage,
     PingMessage,
     ScreenshotRequestMessage,
@@ -455,23 +454,28 @@ class ShimDaemon:
             try:
                 # Use the existing write helper with a synthetic op name.
                 # We don't await here from a sync method; just queue best-effort.
-                asyncio.get_event_loop().create_task(
-                    self.audit.write(
-                        "DAEMON_PREFLIGHT_FAILED",
-                        request_id=new_id(),
-                        details={
-                            "missing_permissions": ["accessibility"],
-                            "platform": plat,
-                            "hint": "Run `autogpt-shim doctor` and grant access.",
-                        },
-                        result={
-                            "ok": False,
-                            "exit_code": 78,
-                            "duration_ms": 0,
-                            "error_code": ErrorCode.PERMISSION_PENDING.value,
-                        },
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    loop.create_task(
+                        self.audit.write(
+                            "DAEMON_PREFLIGHT_FAILED",
+                            request_id=new_id(),
+                            details={
+                                "missing_permissions": ["accessibility"],
+                                "platform": plat,
+                                "hint": "Run `autogpt-shim doctor` and grant access.",
+                            },
+                            result={
+                                "ok": False,
+                                "exit_code": 78,
+                                "duration_ms": 0,
+                                "error_code": ErrorCode.PERMISSION_PENDING.value,
+                            },
+                        )
                     )
-                )
             except Exception:
                 logger.debug("preflight audit emit failed", exc_info=True)
         raise DaemonPreflightError(

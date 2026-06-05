@@ -13,13 +13,11 @@ from unittest.mock import patch
 import pytest
 
 from autogpt_local_executor.audit import (
-    ROTATE_MAX_BYTES,
     AuditWriter,
     canonical_bytes,
     get_or_create_audit_key,
     list_rotated_files,
 )
-
 
 KEY = b"\x00" * 32  # deterministic test key
 
@@ -45,7 +43,7 @@ def test_canonical_sorts_keys_and_strips_whitespace() -> None:
 def test_canonical_handles_unicode() -> None:
     out = canonical_bytes({"k": "café"})
     # JSON spec keeps non-ASCII as-is when ensure_ascii=False.
-    assert out == '{"k":"café"}'.encode("utf-8")
+    assert out == '{"k":"café"}'.encode()
 
 
 def test_canonical_rejects_nan_and_inf() -> None:

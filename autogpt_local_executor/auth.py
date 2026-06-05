@@ -16,7 +16,6 @@ import secrets
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
 
 import httpx
 import keyring
@@ -36,7 +35,7 @@ class KeychainTokenStore:
         Windows → Windows Credential Manager
     """
 
-    async def get_access_token(self) -> Optional[str]:
+    async def get_access_token(self) -> str | None:
         """Return the stored access token, or None if not authenticated."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -67,7 +66,7 @@ class KeychainTokenStore:
         except keyring.errors.PasswordDeleteError:
             pass
 
-    async def get_refresh_token(self) -> Optional[str]:
+    async def get_refresh_token(self) -> str | None:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
@@ -95,7 +94,7 @@ class OAuthFlow:
         code_verifier, code_challenge = self._generate_pkce_pair()
         auth_url = self._build_auth_url(code_challenge)
 
-        print(f"\nOpening browser for AutoGPT authentication...")
+        print("\nOpening browser for AutoGPT authentication...")
         print(f"If it doesn't open automatically, visit:\n  {auth_url}\n")
         webbrowser.open(auth_url)
 

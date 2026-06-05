@@ -14,7 +14,6 @@ from autogpt_local_executor.path_jail import (
     is_inside_jail,
 )
 
-
 # ── Happy path ───────────────────────────────────────────────────────────────
 
 

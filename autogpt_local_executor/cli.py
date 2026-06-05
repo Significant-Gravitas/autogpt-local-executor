@@ -424,7 +424,7 @@ def _audit_export(current: Path, output: Path | None) -> int:
         output = Path.cwd() / f"audit-export-{stamp}.zip"
 
     manifest: dict = {
-        "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "exported_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "files": [],
         "key_username": KEYCHAIN_AUDIT_KEY_USERNAME,
     }

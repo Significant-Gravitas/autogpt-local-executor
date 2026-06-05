@@ -17,7 +17,6 @@ import threading
 import time
 from dataclasses import dataclass
 
-
 WRITEBACK_WINDOW_SECONDS = 30.0
 
 
@@ -48,6 +47,10 @@ class ClipboardWritebackRegistry:
         self._window = window_seconds
         self._record: WritebackRecord | None = None
         self._lock = threading.Lock()
+
+    @property
+    def window_seconds(self) -> float:
+        return self._window
 
     def record_write(self, content: str, sequence: int | None = None) -> WritebackRecord:
         record = WritebackRecord(

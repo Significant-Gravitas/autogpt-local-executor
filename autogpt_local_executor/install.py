@@ -21,9 +21,9 @@ import os
 import platform as _platform
 import shutil
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from . import platform_info
 

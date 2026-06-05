@@ -23,12 +23,10 @@ lives.
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 
-from .config import ShimConfig
 from . import platform_info
-
+from .config import ShimConfig
 
 EX_CONFIG = 78
 
@@ -168,7 +166,6 @@ def _check_macos(config: ShimConfig) -> list[CheckResult]:
             )
         )
 
-    marker = "OK" if config.enable_computer_use and ax and sc else "INFO"
     if config.enable_computer_use:
         if ax and sc:
             out.append(CheckResult("OK", "computer_use", "ready"))

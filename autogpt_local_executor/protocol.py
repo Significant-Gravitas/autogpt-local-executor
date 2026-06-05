@@ -136,6 +136,8 @@ class MessageType(str, Enum):
     PONG = "PONG"
     # Session ownership / lifecycle (see PROTOCOL.md → Session ownership).
     SESSION_REVOKED = "SESSION_REVOKED"
+    # Proactive backpressure / health (see PROTOCOL.md → Backpressure).
+    STATUS = "STATUS"
 
 
 class ErrorCode(str, Enum):
@@ -546,6 +548,26 @@ class SessionRevokedPayload(_Payload):
     new_shim_machine_id: str | None = None
 
 
+# ── Backpressure / health (#38) ──────────────────────────────────────────────
+
+
+class StatusPayload(_Payload):
+    """Periodic, unsolicited shim health snapshot.
+
+    Emitted every 30s during a healthy session and on the full → not-full
+    capacity edge (so the platform's throttle releases promptly). All
+    counts reflect the shim's view at emission time; the platform should
+    treat them as advisory — `pending_capacity` on response envelopes
+    remains the per-response authoritative number.
+    """
+
+    in_flight: int
+    max_concurrent: int
+    queue_depth: int = 0
+    audit_log_bytes: int = 0
+    uptime_seconds: float = 0.0
+
+
 # ── Envelopes ────────────────────────────────────────────────────────────────
 
 
@@ -557,6 +579,13 @@ class _Envelope(BaseModel):
     if it's missing or differs in minor from the negotiation, treat the
     HELLO-time negotiation as truth. A differing major on a non-HELLO frame
     is a hard error (drop the frame, log loudly).
+
+    `pending_capacity` is the shim's free request slots AFTER this frame
+    (max_concurrent - in_flight). Shim-→-platform response frames populate
+    it as a proactive backpressure signal so the platform can pause
+    issuance before SHIM_OVERLOADED kicks in. Always-null on platform-→-shim
+    requests and on shim-internal frames like HELLO. See
+    PROTOCOL.md → Backpressure.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -564,6 +593,7 @@ class _Envelope(BaseModel):
     id: str
     ts: float
     version: str = VERSION
+    pending_capacity: int | None = None
 
 
 class HelloMessage(_Envelope):
@@ -746,9 +776,50 @@ class SessionRevokedMessage(_Envelope):
     payload: SessionRevokedPayload
 
 
+class StatusMessage(_Envelope):
+    type: Literal[MessageType.STATUS] = MessageType.STATUS
+    payload: StatusPayload
+
+
 # Discriminated union — used when parsing inbound frames.
 Message = Annotated[
-    HelloMessage | HelloAckMessage | ExecuteCommandMessage | CommandResultMessage | FileReadMessage | FileContentsMessage | FileWriteMessage | AckMessage | FileStatMessage | FileStatResponseMessage | FileListMessage | FileListResponseMessage | FileDeleteMessage | FileMoveMessage | ScreenshotRequestMessage | ScreenshotResponseMessage | InputActionMessage | CursorPositionRequestMessage | CursorPositionResponseMessage | DisplayInfoRequestMessage | DisplayInfoResponseMessage | WindowListRequestMessage | WindowListResponseMessage | WindowFocusMessage | AppListRequestMessage | AppListResponseMessage | AppLaunchMessage | ClipboardReadMessage | ClipboardReadResponseMessage | ClipboardWriteMessage | PermissionsCheckRequestMessage | PermissionsCheckResponseMessage | ErrorMessage | PingMessage | PongMessage | SessionRevokedMessage,
+    HelloMessage
+    | HelloAckMessage
+    | ExecuteCommandMessage
+    | CommandResultMessage
+    | FileReadMessage
+    | FileContentsMessage
+    | FileWriteMessage
+    | AckMessage
+    | FileStatMessage
+    | FileStatResponseMessage
+    | FileListMessage
+    | FileListResponseMessage
+    | FileDeleteMessage
+    | FileMoveMessage
+    | ScreenshotRequestMessage
+    | ScreenshotResponseMessage
+    | InputActionMessage
+    | CursorPositionRequestMessage
+    | CursorPositionResponseMessage
+    | DisplayInfoRequestMessage
+    | DisplayInfoResponseMessage
+    | WindowListRequestMessage
+    | WindowListResponseMessage
+    | WindowFocusMessage
+    | AppListRequestMessage
+    | AppListResponseMessage
+    | AppLaunchMessage
+    | ClipboardReadMessage
+    | ClipboardReadResponseMessage
+    | ClipboardWriteMessage
+    | PermissionsCheckRequestMessage
+    | PermissionsCheckResponseMessage
+    | ErrorMessage
+    | PingMessage
+    | PongMessage
+    | SessionRevokedMessage
+    | StatusMessage,
     Field(discriminator="type"),
 ]
 
@@ -888,6 +959,8 @@ __all__ = [
     "SessionRevokedMessage",
     "SessionRevokedPayload",
     "Shell",
+    "StatusMessage",
+    "StatusPayload",
     "ValidationError",
     "WindowFocusMessage",
     "WindowFocusPayload",

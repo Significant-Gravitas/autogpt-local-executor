@@ -209,9 +209,7 @@ def test_parse_envelope_tolerates_missing_version() -> None:
 
 
 def test_parse_envelope_accepts_explicit_version() -> None:
-    raw = json.dumps(
-        {"type": "PING", "id": "abc", "ts": 1.0, "version": "1.4", "payload": {}}
-    )
+    raw = json.dumps({"type": "PING", "id": "abc", "ts": 1.0, "version": "1.4", "payload": {}})
     msg = parse_message(raw)
     assert msg.version == "1.4"
 

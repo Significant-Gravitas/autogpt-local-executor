@@ -23,14 +23,12 @@ from autogpt_local_executor.daemon import (
 )
 from autogpt_local_executor.protocol import (
     VERSION,
+    HelloAckMessage,
+    HelloAckPayload,
     ProtocolVersionMismatch,
     dump_message,
     new_id,
     now_ts,
-)
-from autogpt_local_executor.protocol import (
-    HelloAckMessage,
-    HelloAckPayload,
 )
 
 

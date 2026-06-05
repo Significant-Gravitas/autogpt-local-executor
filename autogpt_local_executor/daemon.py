@@ -29,6 +29,8 @@ from .config import ShimConfig
 from .handlers import CommandHandler, ComputerUseHandler, FileHandler
 from .protocol import (
     VERSION as PROTOCOL_VERSION,
+)
+from .protocol import (
     AppLaunchMessage,
     AppListRequestMessage,
     ClipboardReadMessage,
@@ -52,6 +54,8 @@ from .protocol import (
     ProtocolVersionMismatch,
     ScreenshotRequestMessage,
     SessionRevokedMessage,
+    StatusMessage,
+    StatusPayload,
     WindowFocusMessage,
     WindowListRequestMessage,
     dump_message,
@@ -62,6 +66,10 @@ from .protocol import (
     now_ts,
     parse_message,
 )
+
+# How often the shim unprompted-emits a STATUS frame (backpressure / health).
+# Also emitted on the full → not-full capacity transition edge.
+STATUS_INTERVAL_SECONDS: float = 30.0
 
 # WebSocket close codes the platform may use to signal structured failures.
 # Mirrors docs/PROTOCOL.md → Close codes. Application-range (4000-4999).
@@ -99,6 +107,7 @@ class DaemonPreflightError(RuntimeError):
     change.
     """
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,6 +139,17 @@ class ShimDaemon:
         # auto-reconnect (protocol version mismatch, session revoked, etc.).
         # The reconnect loop checks this and exits cleanly.
         self._disable_reconnect: bool = False
+        # Backpressure / health bookkeeping (#38). _in_flight = tasks
+        # currently holding the semaphore; _queue_depth = tasks waiting
+        # to acquire it. Maintained explicitly so we don't have to poke
+        # at asyncio.Semaphore internals.
+        self._in_flight: int = 0
+        self._queue_depth: int = 0
+        # Wall-clock when the current session started (set in _run_session).
+        # Used for STATUS.uptime_seconds.
+        self._session_started_at: float | None = None
+        # Background task that emits periodic STATUS frames.
+        self._status_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def _build_audit_writer(config: ShimConfig) -> AuditWriter | None:
@@ -147,9 +167,7 @@ class ShimDaemon:
                 session_id=config.session_id,
             )
         except Exception as exc:
-            logger.warning(
-                "Audit log disabled — could not acquire audit key: %s", exc
-            )
+            logger.warning("Audit log disabled — could not acquire audit key: %s", exc)
             return None
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -233,7 +251,7 @@ class ShimDaemon:
         """Per docs/PROTOCOL.md Reconnection: 2^attempt * 1s, capped at 60s,
         plus 0-5s jitter."""
         cap = self.config.reconnect_max_delay
-        base = min(self.config.reconnect_base_delay * (2 ** attempt), cap)
+        base = min(self.config.reconnect_base_delay * (2**attempt), cap)
         jitter = random.uniform(0, self.config.reconnect_jitter_seconds)
         return base + jitter
 
@@ -267,6 +285,10 @@ class ShimDaemon:
 
     async def _run_session(self, ws) -> None:
         self._ws = ws
+        self._session_started_at = now_ts()
+        # Reset per-session counters so reconnects don't carry over.
+        self._in_flight = 0
+        self._queue_depth = 0
         if self.audit is not None:
             try:
                 await self.audit.ws_connected(self._connect_url())
@@ -275,6 +297,9 @@ class ShimDaemon:
         disconnect_reason = "clean_exit"
         try:
             await self._handshake(ws)
+            # Start the periodic STATUS ticker AFTER handshake — we want
+            # max_concurrent from HELLO_ACK before announcing capacity.
+            self._status_task = asyncio.create_task(self._status_ticker(ws))
             try:
                 async for raw in ws:
                     await self._on_frame(ws, raw)
@@ -308,7 +333,17 @@ class ShimDaemon:
                 disconnect_reason = f"loop_error: {exc.__class__.__name__}"
                 raise
         finally:
+            # Cancel the periodic STATUS ticker first so it doesn't fight
+            # us for the dying WS.
+            if self._status_task is not None:
+                self._status_task.cancel()
+                try:
+                    await self._status_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._status_task = None
             self._ws = None
+            self._session_started_at = None
             if self.audit is not None:
                 try:
                     await self.audit.ws_disconnected(disconnect_reason)
@@ -362,9 +397,7 @@ class ShimDaemon:
         raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
         ack = parse_message(raw_ack)
         if not isinstance(ack, HelloAckMessage):
-            raise RuntimeError(
-                f"Expected HELLO_ACK, got {type(ack).__name__}"
-            )
+            raise RuntimeError(f"Expected HELLO_ACK, got {type(ack).__name__}")
         # Honor the server's negotiated limits.
         payload = ack.payload
         # Negotiate wire-protocol version BEFORE applying any other limits.
@@ -470,9 +503,7 @@ class ShimDaemon:
 
         asyncio.create_task(self._dispatch(ws, msg))
 
-    async def _handle_session_revoked(
-        self, ws, msg: SessionRevokedMessage
-    ) -> None:
+    async def _handle_session_revoked(self, ws, msg: SessionRevokedMessage) -> None:
         """Per PROTOCOL.md → Session ownership: log, stop sending, close,
         and don't auto-reconnect."""
         reason = msg.payload.reason
@@ -524,24 +555,127 @@ class ShimDaemon:
         except Exception:
             logger.debug("SESSION_REVOKED audit emit failed", exc_info=True)
 
+    # ── Backpressure / health (STATUS frame, #38) ───────────────────────
+
+    def _build_status_message(self) -> StatusMessage:
+        """Snapshot the shim's current backpressure / health state."""
+        audit_bytes = 0
+        try:
+            if self.config.audit_log_path.is_file():
+                audit_bytes = self.config.audit_log_path.stat().st_size
+        except OSError:
+            # Best-effort — a missing/unreadable audit log shouldn't break
+            # health reporting.
+            audit_bytes = 0
+        uptime = 0.0
+        if self._session_started_at is not None:
+            uptime = max(now_ts() - self._session_started_at, 0.0)
+        payload = StatusPayload(
+            in_flight=self._in_flight,
+            max_concurrent=self.config.max_concurrent,
+            queue_depth=self._queue_depth,
+            audit_log_bytes=audit_bytes,
+            uptime_seconds=uptime,
+        )
+        msg = StatusMessage(id=new_id(), ts=now_ts(), payload=payload)
+        # STATUS itself carries pending_capacity too — it IS a backpressure
+        # signal, so be explicit.
+        msg.pending_capacity = self._available_capacity()
+        return msg
+
+    async def _emit_status(self, ws, *, source: str) -> None:
+        """Send a STATUS frame on the WS, swallowing transient send errors.
+
+        `source` is a debug label (capacity_edge, periodic) — not on the wire,
+        just for logging.
+        """
+        try:
+            msg = self._build_status_message()
+            await ws.send(dump_message(msg))
+            logger.debug("STATUS emitted (%s): %s", source, msg.payload)
+        except Exception:
+            logger.debug("STATUS emit failed (%s)", source, exc_info=True)
+
+    async def _status_ticker(self, ws) -> None:
+        """Background task: emit STATUS every STATUS_INTERVAL_SECONDS. The
+        loop exits when the WS is gone or the daemon is told to stop.
+        """
+        try:
+            while self._running and self._ws is ws:
+                await asyncio.sleep(STATUS_INTERVAL_SECONDS)
+                if self._ws is not ws:
+                    return
+                await self._emit_status(ws, source="periodic")
+        except asyncio.CancelledError:
+            raise
+
     async def _dispatch(self, ws, msg: Any) -> None:
         assert self._semaphore is not None
+        # Track queue depth: incremented now, decremented exactly once when
+        # we either acquire the semaphore (transition to in_flight) or bail
+        # out before acquiring (cancellation / error in waiter).
+        self._queue_depth += 1
+        queue_owed = True
+        in_flight_owed = False
+        was_full_after_decrement = False
+        response = None
         try:
-            async with self._semaphore:
-                response = await self._handle(msg)
-        except Exception as exc:
-            logger.exception("Handler crashed for %s", type(msg).__name__)
-            response = make_error(
-                msg.id if hasattr(msg, "id") else new_id(),
-                ErrorCode.INTERNAL_ERROR,
-                str(exc),
-            )
+            try:
+                async with self._semaphore:
+                    # We've acquired — move the credit from queue → in_flight.
+                    self._queue_depth -= 1
+                    queue_owed = False
+                    self._in_flight += 1
+                    in_flight_owed = True
+                    try:
+                        response = await self._handle(msg)
+                    finally:
+                        was_full_after_decrement = self._in_flight == self.config.max_concurrent
+                        self._in_flight -= 1
+                        in_flight_owed = False
+            except Exception as exc:
+                logger.exception("Handler crashed for %s", type(msg).__name__)
+                response = make_error(
+                    msg.id if hasattr(msg, "id") else new_id(),
+                    ErrorCode.INTERNAL_ERROR,
+                    str(exc),
+                )
+        finally:
+            # Belt-and-braces: if either counter is still owed (e.g. we got
+            # cancelled mid-acquire), make it whole. Without this a crashed
+            # waiter would skew queue_depth forever.
+            if queue_owed:
+                self._queue_depth -= 1
+            if in_flight_owed:
+                self._in_flight -= 1
+
         if response is None:
             return
+
+        # Stamp pending_capacity on the response envelope so the platform can
+        # throttle issuance before we trip SHIM_OVERLOADED. Compute AFTER
+        # decrementing _in_flight so the number reflects post-response slots.
+        try:
+            response.pending_capacity = self._available_capacity()
+        except Exception:
+            # _Envelope subclasses all carry the field via the base; this
+            # is just paranoia for any future hand-rolled response model.
+            logger.debug("could not stamp pending_capacity", exc_info=True)
+
         try:
             await ws.send(dump_message(response))
         except Exception:
             logger.debug("Failed to send response", exc_info=True)
+
+        # If we just freed a slot from a fully-saturated state, push an
+        # unsolicited STATUS frame so the platform's throttle releases
+        # promptly (don't wait for the 30s tick).
+        if was_full_after_decrement:
+            await self._emit_status(ws, source="capacity_edge")
+
+    def _available_capacity(self) -> int:
+        """Free request slots right now. Floored at 0."""
+        return max(self.config.max_concurrent - self._in_flight, 0)
 
     _COMPUTER_USE_MESSAGE_TYPES = (
         ScreenshotRequestMessage,
@@ -596,9 +730,7 @@ class ShimDaemon:
             )
         except ImportError:
             # No pyobjc — can't check. Treat as a warning, not a fail.
-            logger.warning(
-                "Cannot probe Accessibility: pyobjc/ApplicationServices not installed."
-            )
+            logger.warning("Cannot probe Accessibility: pyobjc/ApplicationServices not installed.")
             return
         try:
             trusted = bool(AXIsProcessTrusted())

@@ -720,6 +720,76 @@ The platform may send multiple requests before receiving responses (pipelined). 
 assigns each request its own async task and responds with matching `id` when complete.
 Max concurrent requests: `HELLO_ACK.max_concurrent` (default 4).
 
+---
+
+## Backpressure
+
+Pre-#38 the only backpressure signal was the after-the-fact
+`SHIM_OVERLOADED` error — the platform issued a request, the shim
+rejected it. Better: have the shim proactively advertise free capacity
+so the platform can throttle issuance before it hits the wall.
+
+### `pending_capacity` on every response envelope
+
+All shim-→-platform response envelopes carry a top-level
+`pending_capacity: int` (placed at envelope level, peer to `id` /
+`ts` / `version`). Value:
+
+```
+pending_capacity = max_concurrent - in_flight_after_this_response
+```
+
+i.e. free slots immediately AFTER this response is sent (we've already
+released ours). `0` means "I'm fully saturated — pause issuance". Field
+is omitted (or `null`) on platform-→-shim requests and on shim-internal
+frames like HELLO; the platform MUST treat absent/null as "no signal,
+use prior value".
+
+The platform's `LocalPCShim` adapter SHOULD maintain a per-shim
+in-memory `capacity_remaining` counter, decrement on issue, refresh
+from `pending_capacity` on each response, and pause new issuance when
+the counter hits 0. Wiring that consumer is a separate platform-side
+ticket; this section is the contract.
+
+### `STATUS` frame (shim → platform, unsolicited, periodic)
+
+```json
+{
+  "type": "STATUS",
+  "id": "uuid",
+  "ts": 1234567890.0,
+  "version": "1.0",
+  "pending_capacity": 3,
+  "payload": {
+    "in_flight": 1,
+    "max_concurrent": 4,
+    "queue_depth": 0,
+    "audit_log_bytes": 12345,
+    "uptime_seconds": 137.4
+  }
+}
+```
+
+Emission cadence:
+
+- **Every 30s** (`STATUS_INTERVAL_SECONDS` in shim source) while the WS
+  is healthy. Cheap unsolicited heartbeat — lets the platform observe
+  shim health without spamming an `is_alive` probe.
+- **On the full → not-full edge.** When the shim finishes a request
+  that took the last free slot, a STATUS frame is emitted IMMEDIATELY
+  after the response (in addition to the response carrying
+  `pending_capacity=1`), so the platform's throttle releases without
+  waiting up to 30s for the next tick.
+
+Receivers MUST treat `STATUS` as advisory — the per-response
+`pending_capacity` remains the authoritative number. A receiver that
+doesn't understand `STATUS` MAY drop it; the field is forward-compatible
+and the spec's discriminated union just gains it within v1.x.
+
+> The platform-side consumer that reads `pending_capacity` / `STATUS`
+> and throttles issuance lives in a separate ticket; this section is
+> the contract the shim implements on the emit side.
+
 ## Reconnection
 
 Shim uses exponential backoff: `min(2^attempt * 1s, 60s) + jitter(0-5s)`.

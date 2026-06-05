@@ -39,7 +39,6 @@ from autogpt_local_executor.protocol import (
     now_ts,
 )
 
-
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
 
@@ -84,7 +83,7 @@ class _FakeWebSocket:
             raise nxt
         return nxt
 
-    def __aiter__(self) -> "_FakeWebSocket":
+    def __aiter__(self) -> _FakeWebSocket:
         return self
 
     async def __anext__(self) -> str:
@@ -122,7 +121,9 @@ class _RecordingAudit:
     def set_session_id(self, _sid: str) -> None:
         pass
 
-    async def write(self, op: str, *, request_id: Any = None, details: dict[str, Any], result: Any = None) -> None:
+    async def write(
+        self, op: str, *, request_id: Any = None, details: dict[str, Any], result: Any = None
+    ) -> None:
         self.events.append((op, details))
 
     async def shim_start(self, *_a: Any, **_k: Any) -> None:
@@ -168,7 +169,9 @@ def _hello_ack() -> str:
     return dump_message(HelloAckMessage(id=new_id(), ts=now_ts(), payload=payload))
 
 
-def _session_revoked_frame(reason: str = "another_shim_connected", new_mid: str | None = None) -> str:
+def _session_revoked_frame(
+    reason: str = "another_shim_connected", new_mid: str | None = None
+) -> str:
     return dump_message(
         SessionRevokedMessage(
             id=new_id(),

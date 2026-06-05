@@ -181,7 +181,7 @@ async def test_dispatch_stamps_pending_capacity_on_response(
 
     response = AckMessage(id="reqid", ts=now_ts(), payload=AckPayload(ok=True))
 
-    async def fake_handle(_msg: Any) -> AckMessage:
+    async def fake_handle(_msg: Any, *, send: Any = None) -> AckMessage:
         return response
 
     monkeypatch.setattr(daemon, "_handle", fake_handle)
@@ -214,7 +214,7 @@ async def test_dispatch_emits_status_on_full_to_not_full_edge(
 
     response = AckMessage(id="reqid", ts=now_ts(), payload=AckPayload(ok=True))
 
-    async def fake_handle(_msg: Any) -> AckMessage:
+    async def fake_handle(_msg: Any, *, send: Any = None) -> AckMessage:
         return response
 
     monkeypatch.setattr(daemon, "_handle", fake_handle)
@@ -245,7 +245,7 @@ async def test_dispatch_does_not_emit_status_when_not_at_edge(
 
     response = AckMessage(id="reqid", ts=now_ts(), payload=AckPayload(ok=True))
 
-    async def fake_handle(_msg: Any) -> AckMessage:
+    async def fake_handle(_msg: Any, *, send: Any = None) -> AckMessage:
         return response
 
     monkeypatch.setattr(daemon, "_handle", fake_handle)

@@ -73,6 +73,13 @@ from .protocol import (
     FileStatResponsePayload,
     FileWriteMessage,
     InputActionMessage,
+    LocalLLMCompletionChunkMessage,
+    LocalLLMCompletionChunkPayload,
+    LocalLLMCompletionMessage,
+    LocalLLMCompletionResponseMessage,
+    LocalLLMCompletionResponsePayload,
+    LocalLLMFinishReason,
+    LocalLLMTokensUsage,
     PermissionsCheckRequestMessage,
     PermissionsCheckResponseMessage,
     PermissionsCheckResponsePayload,
@@ -1401,8 +1408,408 @@ class ComputerUseHandler:
         )
 
 
+# ── Local LLM ────────────────────────────────────────────────────────────────
+
+
+class OllamaBackendError(Exception):
+    """Raised by OllamaBackend when the upstream HTTP call fails.
+
+    Carries the ErrorCode the LocalLLMHandler should surface plus the raw
+    backend error string for `details.backend_error` on the wire.
+    """
+
+    def __init__(self, code: ErrorCode, backend_error: str) -> None:
+        self.code = code
+        self.backend_error = backend_error
+        super().__init__(f"{code.value}: {backend_error}")
+
+
+class OllamaBackend:
+    """Thin async wrapper over Ollama's HTTP API.
+
+    Only the two endpoints the shim needs: GET /api/tags for model probing
+    at HELLO time, and POST /api/chat (streaming or one-shot) for completion
+    requests. Mocked via httpx.AsyncClient in tests.
+    """
+
+    def __init__(self, base_url: str, *, timeout_seconds: float = 60.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+
+    async def list_models(self) -> list[str]:
+        """Return the list of currently-loaded model names.
+
+        Raises OllamaBackendError on transport failure. Caller (HELLO probe)
+        catches and translates to "no local_llm capability".
+        """
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(f"{self.base_url}/api/tags")
+        except httpx.RequestError as exc:
+            raise OllamaBackendError(ErrorCode.LOCAL_LLM_FAILED, str(exc)) from exc
+        if r.status_code != 200:
+            raise OllamaBackendError(
+                ErrorCode.LOCAL_LLM_FAILED,
+                f"HTTP {r.status_code} from /api/tags",
+            )
+        try:
+            data = r.json()
+        except ValueError as exc:
+            raise OllamaBackendError(ErrorCode.LOCAL_LLM_FAILED, f"bad JSON: {exc}") from exc
+        models = data.get("models") or []
+        return [m["name"] for m in models if isinstance(m, dict) and "name" in m]
+
+    async def chat_stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ):
+        """Yield streaming response chunks from /api/chat.
+
+        Each yielded value is the parsed JSON line dict. Caller stitches
+        `chunk["message"]["content"]` deltas together and uses the final
+        line's `done: true` + token counters for the terminal frame.
+
+        Raises OllamaBackendError on connection errors (LOCAL_LLM_FAILED)
+        and 404 (MODEL_NOT_AVAILABLE). 503 also maps to LOCAL_LLM_FAILED.
+        """
+        import httpx
+
+        body = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "top_p": top_p,
+                "num_predict": max_tokens,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                async with client.stream("POST", f"{self.base_url}/api/chat", json=body) as r:
+                    if r.status_code == 404:
+                        # Read body for the model-not-found message.
+                        try:
+                            err_text = (await r.aread()).decode("utf-8", errors="replace")
+                        except Exception:
+                            err_text = "model not found"
+                        raise OllamaBackendError(ErrorCode.MODEL_NOT_AVAILABLE, err_text)
+                    if r.status_code >= 500:
+                        try:
+                            err_text = (await r.aread()).decode("utf-8", errors="replace")
+                        except Exception:
+                            err_text = f"HTTP {r.status_code}"
+                        raise OllamaBackendError(ErrorCode.LOCAL_LLM_FAILED, err_text)
+                    if r.status_code != 200:
+                        try:
+                            err_text = (await r.aread()).decode("utf-8", errors="replace")
+                        except Exception:
+                            err_text = f"HTTP {r.status_code}"
+                        raise OllamaBackendError(ErrorCode.LOCAL_LLM_FAILED, err_text)
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            import json as _json
+
+                            yield _json.loads(line)
+                        except ValueError:
+                            # Skip malformed lines; Ollama shouldn't emit them
+                            # but be defensive.
+                            continue
+        except httpx.RequestError as exc:
+            raise OllamaBackendError(ErrorCode.LOCAL_LLM_FAILED, str(exc)) from exc
+
+
+class LocalLLMHandler:
+    """Dispatch LOCAL_LLM_COMPLETION requests to the local backend.
+
+    Streams response chunks back as LOCAL_LLM_COMPLETION_CHUNK frames and
+    emits a terminal LOCAL_LLM_COMPLETION_RESPONSE with the assembled
+    output + token accounting.
+
+    Concurrency: Ollama serializes requests by default. We track active
+    requests via asyncio.Lock with a try-acquire; a second request that
+    arrives while one is in flight gets LOCAL_LLM_BUSY immediately rather
+    than queueing (the platform's auto-retry layer is the better place
+    for that decision).
+    """
+
+    def __init__(
+        self,
+        config: ShimConfig,
+        audit: AuditWriter | None = None,
+        backend: OllamaBackend | None = None,
+    ) -> None:
+        self.config = config
+        self.audit = audit
+        self._backend = backend or OllamaBackend(config.ollama_url)
+        # One-at-a-time semaphore for the underlying backend. Ollama is
+        # single-threaded by default; the LOCAL_LLM_BUSY error code is the
+        # contract the platform retries against.
+        self._inflight_lock = asyncio.Lock()
+        # Cached model list from the most-recent probe(). Populated at HELLO
+        # emission time so we can reject unknown models without a round trip.
+        self._models: list[str] = []
+
+    @property
+    def models(self) -> list[str]:
+        return list(self._models)
+
+    async def probe(self) -> list[str]:
+        """Query Ollama for loaded models. Called at HELLO emission.
+
+        Returns the model list on success; returns [] AND swallows the
+        OllamaBackendError on failure. Caller (daemon._build_hello) uses
+        an empty list to mean "omit local_llm capability + no advertised
+        models" per LOCAL_LLM.md.
+        """
+        try:
+            models = await self._backend.list_models()
+        except OllamaBackendError as exc:
+            logger.debug("Ollama probe failed: %s", exc)
+            self._models = []
+            return []
+        self._models = models
+        return models
+
+    async def handle(
+        self,
+        msg: LocalLLMCompletionMessage,
+        *,
+        send: Any | None = None,
+    ) -> LocalLLMCompletionResponseMessage | ErrorMessage:
+        """Process a completion request.
+
+        `send` is an async callable that takes a single envelope and pushes
+        it on the WS — used to emit CHUNK frames mid-stream. Returns the
+        terminal RESPONSE (or ERROR) for the standard dispatch path to send.
+        When `send` is None (tests), CHUNK emissions are silently dropped
+        and only the terminal frame is returned.
+        """
+        payload = msg.payload
+        start = time.monotonic()
+        details_base = {
+            "model": payload.model,
+            "stream": payload.stream,
+            "prompt_chars": sum(len(m.content) for m in payload.messages),
+        }
+
+        # Pre-check model against our cached probe. Backend will re-confirm
+        # (404 → MODEL_NOT_AVAILABLE) but failing fast here saves a round
+        # trip when the platform's local_llm_models list is stale.
+        if self._models and payload.model not in self._models:
+            await self._emit(
+                msg.id,
+                {**details_base, "response_chars": 0, "finish_reason": None},
+                _err_result(_elapsed_ms(start), ErrorCode.MODEL_NOT_AVAILABLE.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.MODEL_NOT_AVAILABLE,
+                f"Model {payload.model!r} not in advertised list.",
+                details={
+                    "requested_model": payload.model,
+                    "available_models": list(self._models),
+                },
+            )
+
+        # Backpressure: Ollama only serves one request at a time. A second
+        # caller while another is in-flight gets LOCAL_LLM_BUSY.
+        if self._inflight_lock.locked():
+            await self._emit(
+                msg.id,
+                {**details_base, "response_chars": 0, "finish_reason": None},
+                _err_result(_elapsed_ms(start), ErrorCode.LOCAL_LLM_BUSY.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.LOCAL_LLM_BUSY,
+                "Local LLM backend is already processing another request.",
+            )
+
+        async with self._inflight_lock:
+            return await self._run_completion(
+                msg, send=send, details_base=details_base, start=start
+            )
+
+    async def _run_completion(
+        self,
+        msg: LocalLLMCompletionMessage,
+        *,
+        send: Any | None,
+        details_base: dict,
+        start: float,
+    ) -> LocalLLMCompletionResponseMessage | ErrorMessage:
+        payload = msg.payload
+        messages_wire = [{"role": m.role, "content": m.content} for m in payload.messages]
+        content_buf: list[str] = []
+        finish_reason: LocalLLMFinishReason = "stop"
+        prompt_tokens: int | None = None
+        completion_tokens: int | None = None
+
+        try:
+            async for chunk in self._backend.chat_stream(
+                model=payload.model,
+                messages=messages_wire,
+                max_tokens=payload.max_tokens,
+                temperature=payload.temperature,
+                top_p=payload.top_p,
+            ):
+                delta = ""
+                msg_obj = chunk.get("message") or {}
+                if isinstance(msg_obj, dict):
+                    delta = msg_obj.get("content") or ""
+                done = bool(chunk.get("done"))
+
+                # Final-chunk token accounting from Ollama. Field names per
+                # the documented Ollama /api/chat response.
+                if done:
+                    if "prompt_eval_count" in chunk:
+                        prompt_tokens = int(chunk["prompt_eval_count"])
+                    if "eval_count" in chunk:
+                        completion_tokens = int(chunk["eval_count"])
+                    # Ollama uses `done_reason` ("stop" | "length") on the
+                    # terminal frame. Default to "stop" when unspecified.
+                    raw_reason = chunk.get("done_reason") or "stop"
+                    if raw_reason in ("stop", "length", "content_filter"):
+                        finish_reason = raw_reason  # type: ignore[assignment]
+                    else:
+                        finish_reason = "stop"
+
+                if delta:
+                    content_buf.append(delta)
+                    if payload.stream and send is not None:
+                        chunk_msg = LocalLLMCompletionChunkMessage(
+                            id=msg.id,
+                            ts=now_ts(),
+                            payload=LocalLLMCompletionChunkPayload(
+                                delta=delta,
+                                finish_reason=None,
+                            ),
+                        )
+                        try:
+                            await send(chunk_msg)
+                        except Exception:
+                            logger.debug("Failed to send LLM chunk", exc_info=True)
+
+                if done:
+                    # Emit terminal-marker chunk (delta="", finish_reason=stop/length)
+                    # before the response. Platform consumers that only watch
+                    # CHUNK frames see the stream close before the metadata.
+                    if payload.stream and send is not None:
+                        chunk_msg = LocalLLMCompletionChunkMessage(
+                            id=msg.id,
+                            ts=now_ts(),
+                            payload=LocalLLMCompletionChunkPayload(
+                                delta="",
+                                finish_reason=finish_reason,
+                            ),
+                        )
+                        try:
+                            await send(chunk_msg)
+                        except Exception:
+                            logger.debug("Failed to send LLM terminal chunk", exc_info=True)
+                    break
+        except OllamaBackendError as exc:
+            details = {
+                **details_base,
+                "response_chars": sum(len(c) for c in content_buf),
+                "finish_reason": None,
+            }
+            await self._emit(
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), exc.code.value),
+            )
+            return make_error(
+                msg.id,
+                exc.code,
+                _local_llm_error_message(exc.code, exc.backend_error),
+                details={"backend_error": exc.backend_error},
+            )
+        except Exception as exc:
+            logger.exception("LocalLLMHandler crashed")
+            await self._emit(
+                msg.id,
+                {**details_base, "response_chars": 0, "finish_reason": None},
+                _err_result(_elapsed_ms(start), ErrorCode.LOCAL_LLM_FAILED.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.LOCAL_LLM_FAILED,
+                str(exc),
+                details={"backend_error": str(exc)},
+            )
+
+        duration = time.monotonic() - start
+        content = "".join(content_buf)
+        total_tokens: int | None = None
+        if prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
+
+        details = {
+            **details_base,
+            "response_chars": len(content),
+            "finish_reason": finish_reason,
+            "tokens_prompt": prompt_tokens,
+            "tokens_completion": completion_tokens,
+            "tokens_total": total_tokens,
+        }
+        await self._emit(msg.id, details, _ok_result(_elapsed_ms(start)))
+
+        return LocalLLMCompletionResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=LocalLLMCompletionResponsePayload(
+                content=content,
+                finish_reason=finish_reason,
+                tokens=LocalLLMTokensUsage(
+                    prompt=prompt_tokens,
+                    completion=completion_tokens,
+                    total=total_tokens,
+                ),
+                duration_seconds=round(duration, 3),
+            ),
+        )
+
+    async def _emit(self, request_id: str, details: dict, result: dict) -> None:
+        if self.audit is None:
+            return
+        try:
+            await self.audit.write(
+                "LOCAL_LLM_COMPLETION",
+                request_id=request_id,
+                details=details,
+                result=result,
+            )
+        except Exception:
+            logger.debug("Failed to write LOCAL_LLM_COMPLETION audit record", exc_info=True)
+
+
+def _local_llm_error_message(code: ErrorCode, backend_error: str) -> str:
+    """Human-readable wire message that the platform-side translator turns
+    into a user-facing message. Keep terse — the backend_error in details
+    carries the verbose context."""
+    if code == ErrorCode.MODEL_NOT_AVAILABLE:
+        return "Requested local LLM model is not loaded on the shim."
+    if code == ErrorCode.LOCAL_LLM_BUSY:
+        return "Local LLM backend is already serving another request."
+    return f"Local LLM backend failed: {backend_error[:200]}"
+
+
 __all__ = [
     "CommandHandler",
     "ComputerUseHandler",
     "FileHandler",
+    "LocalLLMHandler",
+    "OllamaBackend",
+    "OllamaBackendError",
 ]

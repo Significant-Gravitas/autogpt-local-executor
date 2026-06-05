@@ -26,7 +26,7 @@ from . import platform_info
 from .audit import AuditWriter, get_or_create_audit_key
 from .auth import KeychainTokenStore
 from .config import ShimConfig
-from .handlers import CommandHandler, ComputerUseHandler, FileHandler
+from .handlers import CommandHandler, ComputerUseHandler, FileHandler, LocalLLMHandler
 from .protocol import (
     VERSION as PROTOCOL_VERSION,
 )
@@ -49,6 +49,7 @@ from .protocol import (
     HelloMessage,
     HelloPayload,
     InputActionMessage,
+    LocalLLMCompletionMessage,
     PermissionsCheckRequestMessage,
     PingMessage,
     ProtocolVersionMismatch,
@@ -128,6 +129,7 @@ class ShimDaemon:
         self._file_handler = FileHandler(config, audit=self.audit)
         self._command_handler = CommandHandler(config, audit=self.audit)
         self._computer_handler = ComputerUseHandler(config, audit=self.audit)
+        self._local_llm_handler = LocalLLMHandler(config, audit=self.audit)
         self._running = False
         self._ws: Any = None
         self._semaphore: asyncio.Semaphore | None = None
@@ -392,7 +394,7 @@ class ShimDaemon:
                 self._computer_handler.on_hello()
             except Exception:
                 logger.debug("computer-use on_hello failed", exc_info=True)
-        hello = self._build_hello()
+        hello = await self._build_hello()
         await ws.send(dump_message(hello))
         raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
         ack = parse_message(raw_ack)
@@ -441,7 +443,7 @@ class ShimDaemon:
         )
         return ack
 
-    def _build_hello(self) -> HelloMessage:
+    async def _build_hello(self) -> HelloMessage:
         cfg = self.config
         caps = platform_info.detect_capabilities(
             enable_shell=cfg.enable_shell,
@@ -458,6 +460,22 @@ class ShimDaemon:
                 cu_features_coarse = list(self._computer_handler.backend.coarse_features())
             except Exception:
                 logger.debug("computer-use feature probe failed", exc_info=True)
+        # Per LOCAL_LLM.md: probe Ollama at HELLO time. On any failure we
+        # OMIT the local_llm capability AND leave local_llm_models empty.
+        local_llm_models: list[str] = []
+        if cfg.enable_local_llm:
+            try:
+                local_llm_models = await self._local_llm_handler.probe()
+            except Exception:
+                logger.debug("Local LLM probe raised; treating as unavailable", exc_info=True)
+                local_llm_models = []
+            if local_llm_models:
+                if "local_llm" not in caps:
+                    caps.append("local_llm")
+            else:
+                # Probe failed or returned no models — strip the capability
+                # so the platform doesn't try to route to us.
+                caps = [c for c in caps if c != "local_llm"]
         payload = HelloPayload(
             shim_version=__import__("autogpt_local_executor").__version__,
             machine_id=cfg.machine_id,
@@ -466,7 +484,7 @@ class ShimDaemon:
             screen_resolution=screen,
             capabilities=caps,
             allowed_root=str(cfg.allowed_root),
-            local_llm_models=[],
+            local_llm_models=local_llm_models,
             hardware_devices=[],
             computer_use_features=cu_features,
             computer_use_features_coarse=cu_features_coarse,
@@ -619,6 +637,18 @@ class ShimDaemon:
         in_flight_owed = False
         was_full_after_decrement = False
         response = None
+
+        # Streaming ops (LOCAL_LLM_COMPLETION) emit intermediate frames
+        # via this callback before the terminal RESPONSE flows through the
+        # standard one-frame-per-request path below. CHUNK frames do NOT
+        # carry pending_capacity (we're still mid-request) and aren't
+        # treated as responses for the backpressure accounting.
+        async def _stream_send(frame: Any) -> None:
+            try:
+                await ws.send(dump_message(frame))
+            except Exception:
+                logger.debug("Failed to send streaming frame", exc_info=True)
+
         try:
             try:
                 async with self._semaphore:
@@ -628,7 +658,7 @@ class ShimDaemon:
                     self._in_flight += 1
                     in_flight_owed = True
                     try:
-                        response = await self._handle(msg)
+                        response = await self._handle(msg, send=_stream_send)
                     finally:
                         was_full_after_decrement = self._in_flight == self.config.max_concurrent
                         self._in_flight -= 1
@@ -691,7 +721,7 @@ class ShimDaemon:
         PermissionsCheckRequestMessage,
     )
 
-    async def _handle(self, msg: Any) -> BaseModel | None:
+    async def _handle(self, msg: Any, *, send: Any | None = None) -> BaseModel | None:
         if isinstance(msg, ExecuteCommandMessage):
             return await self._command_handler.handle(msg)
         if isinstance(msg, FileReadMessage):
@@ -708,6 +738,8 @@ class ShimDaemon:
             return await self._file_handler.handle_move(msg)
         if isinstance(msg, self._COMPUTER_USE_MESSAGE_TYPES):
             return await self._computer_handler.handle(msg)
+        if isinstance(msg, LocalLLMCompletionMessage):
+            return await self._local_llm_handler.handle(msg, send=send)
         # Anything else (e.g., responses we didn't ask for) is silently dropped.
         logger.debug("No handler for %s; dropping", type(msg).__name__)
         return None

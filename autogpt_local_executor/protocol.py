@@ -138,6 +138,10 @@ class MessageType(str, Enum):
     SESSION_REVOKED = "SESSION_REVOKED"
     # Proactive backpressure / health (see PROTOCOL.md → Backpressure).
     STATUS = "STATUS"
+    # Local LLM routing (see PROTOCOL.md → Local LLM + docs/LOCAL_LLM.md).
+    LOCAL_LLM_COMPLETION = "LOCAL_LLM_COMPLETION"
+    LOCAL_LLM_COMPLETION_CHUNK = "LOCAL_LLM_COMPLETION_CHUNK"
+    LOCAL_LLM_COMPLETION_RESPONSE = "LOCAL_LLM_COMPLETION_RESPONSE"
 
 
 class ErrorCode(str, Enum):
@@ -162,6 +166,10 @@ class ErrorCode(str, Enum):
     FEATURE_NOT_SUPPORTED = "FEATURE_NOT_SUPPORTED"
     CLIPBOARD_CONCEALED = "CLIPBOARD_CONCEALED"
     INPUT_OUT_OF_BOUNDS = "INPUT_OUT_OF_BOUNDS"
+    # Local LLM additions (see docs/LOCAL_LLM.md).
+    MODEL_NOT_AVAILABLE = "MODEL_NOT_AVAILABLE"
+    LOCAL_LLM_BUSY = "LOCAL_LLM_BUSY"
+    LOCAL_LLM_FAILED = "LOCAL_LLM_FAILED"
 
 
 class Platform(str, Enum):
@@ -568,6 +576,72 @@ class StatusPayload(_Payload):
     uptime_seconds: float = 0.0
 
 
+# ── Local LLM routing (see docs/LOCAL_LLM.md) ────────────────────────────────
+
+
+class LocalLLMMessage(BaseModel):
+    """One element of `LOCAL_LLM_COMPLETION.messages` — chat-completions style."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+# Finish reasons follow the chat-completions vocabulary. v1.x: these three;
+# future minor versions MAY add more (e.g. "tool_call") — receivers tolerate.
+LocalLLMFinishReason = Literal["stop", "length", "content_filter"]
+
+
+class LocalLLMCompletionPayload(_Payload):
+    """Request a completion from the local LLM backend.
+
+    `model` MUST be in `HELLO.local_llm_models`. `stream=True` (default)
+    emits LOCAL_LLM_COMPLETION_CHUNK frames followed by a single
+    LOCAL_LLM_COMPLETION_RESPONSE; `stream=False` emits only the
+    response.
+    """
+
+    model: str
+    messages: list[LocalLLMMessage]
+    max_tokens: int = 1024
+    temperature: float = 0.0
+    top_p: float = 1.0
+    stream: bool = True
+
+
+class LocalLLMCompletionChunkPayload(_Payload):
+    """One streaming chunk. Final chunk in a stream has `finish_reason` set."""
+
+    delta: str
+    finish_reason: LocalLLMFinishReason | None = None
+
+
+class LocalLLMTokensUsage(BaseModel):
+    """Best-effort token accounting. Any sub-field MAY be null if the
+    backend doesn't report it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: int | None = None
+    completion: int | None = None
+    total: int | None = None
+
+
+class LocalLLMCompletionResponsePayload(_Payload):
+    """Terminal frame for a LOCAL_LLM_COMPLETION request.
+
+    Always emitted exactly once per request, after any/all CHUNK frames
+    in the streaming case or as the sole response in the non-streaming
+    case.
+    """
+
+    content: str
+    finish_reason: LocalLLMFinishReason
+    tokens: LocalLLMTokensUsage = Field(default_factory=LocalLLMTokensUsage)
+    duration_seconds: float
+
+
 # ── Envelopes ────────────────────────────────────────────────────────────────
 
 
@@ -781,6 +855,23 @@ class StatusMessage(_Envelope):
     payload: StatusPayload
 
 
+class LocalLLMCompletionMessage(_Envelope):
+    type: Literal[MessageType.LOCAL_LLM_COMPLETION] = MessageType.LOCAL_LLM_COMPLETION
+    payload: LocalLLMCompletionPayload
+
+
+class LocalLLMCompletionChunkMessage(_Envelope):
+    type: Literal[MessageType.LOCAL_LLM_COMPLETION_CHUNK] = MessageType.LOCAL_LLM_COMPLETION_CHUNK
+    payload: LocalLLMCompletionChunkPayload
+
+
+class LocalLLMCompletionResponseMessage(_Envelope):
+    type: Literal[MessageType.LOCAL_LLM_COMPLETION_RESPONSE] = (
+        MessageType.LOCAL_LLM_COMPLETION_RESPONSE
+    )
+    payload: LocalLLMCompletionResponsePayload
+
+
 # Discriminated union — used when parsing inbound frames.
 Message = Annotated[
     HelloMessage
@@ -819,7 +910,10 @@ Message = Annotated[
     | PingMessage
     | PongMessage
     | SessionRevokedMessage
-    | StatusMessage,
+    | StatusMessage
+    | LocalLLMCompletionMessage
+    | LocalLLMCompletionChunkMessage
+    | LocalLLMCompletionResponseMessage,
     Field(discriminator="type"),
 ]
 
@@ -940,6 +1034,15 @@ __all__ = [
     "HelloPayload",
     "InputActionMessage",
     "InputActionPayload",
+    "LocalLLMCompletionChunkMessage",
+    "LocalLLMCompletionChunkPayload",
+    "LocalLLMCompletionMessage",
+    "LocalLLMCompletionPayload",
+    "LocalLLMCompletionResponseMessage",
+    "LocalLLMCompletionResponsePayload",
+    "LocalLLMFinishReason",
+    "LocalLLMMessage",
+    "LocalLLMTokensUsage",
     "Message",
     "MessageType",
     "PermissionsCheckRequestMessage",

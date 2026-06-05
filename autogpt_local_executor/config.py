@@ -129,6 +129,14 @@ class ShimConfig(BaseSettings):
     reconnect_max_delay: float = Field(default=60.0)
     reconnect_jitter_seconds: float = Field(default=5.0)
 
+    # ── Local LLM (see docs/LOCAL_LLM.md) ──────────────────────────────────
+    ollama_url: str = Field(
+        default="http://localhost:11434",
+        description="Base URL of the Ollama HTTP API. Override to point at "
+        "a remote Ollama on the LAN or a non-default localhost port. "
+        "Probed at HELLO time to populate HELLO.local_llm_models.",
+    )
+
     # ── Computer use ───────────────────────────────────────────────────────
     max_screenshots_per_minute: int = Field(default=10)
     enable_clipboard: bool = Field(

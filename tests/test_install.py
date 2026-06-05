@@ -57,7 +57,10 @@ def test_render_systemd_unit_has_all_placeholders_filled(
     out = install_mod.render_template("systemd.service.template", ctx)
     assert "{shim_executable_path}" not in out
     assert "{config_path}" not in out
-    assert "ExecStart=/opt/bin/autogpt-shim --config /opt/etc/autogpt-local-executor/config.toml start" in out
+    assert (
+        "ExecStart=/opt/bin/autogpt-shim --config /opt/etc/autogpt-local-executor/config.toml start"
+        in out
+    )
     assert "Restart=on-failure" in out
     assert "WantedBy=default.target" in out
 
@@ -70,7 +73,9 @@ def test_render_task_xml_has_all_placeholders_filled(
     assert "{config_path}" not in out
     assert "<LogonTrigger>" in out
     assert "<Command>/opt/bin/autogpt-shim</Command>" in out
-    assert '<Arguments>--config "/opt/etc/autogpt-local-executor/config.toml" start</Arguments>' in out
+    assert (
+        '<Arguments>--config "/opt/etc/autogpt-local-executor/config.toml" start</Arguments>' in out
+    )
 
 
 def test_render_no_user_specific_paths_leak(
@@ -102,9 +107,7 @@ def test_target_path_linux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert p == tmp_path / ".config" / "systemd" / "user" / "autogpt-shim.service"
 
 
-def test_target_path_linux_respects_xdg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_target_path_linux_respects_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     xdg = tmp_path / "xdg-config"
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
     p = install_mod.target_path_for("linux", home=tmp_path)
@@ -138,12 +141,12 @@ def _patch_platform(name: str):
     return patch("platform.system", return_value=mapping[name])
 
 
-def test_install_macos_writes_plist(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_install_macos_writes_plist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(install_mod, "default_stdout_log", lambda: tmp_path / "out.log")
     monkeypatch.setattr(install_mod, "default_stderr_log", lambda: tmp_path / "err.log")
-    monkeypatch.setattr(install_mod, "resolve_shim_executable", lambda: "/usr/local/bin/autogpt-shim")
+    monkeypatch.setattr(
+        install_mod, "resolve_shim_executable", lambda: "/usr/local/bin/autogpt-shim"
+    )
     with _patch_platform("darwin"):
         status = install_mod.install_autostart(
             config_path=tmp_path / "cfg.toml",
@@ -159,9 +162,7 @@ def test_install_macos_writes_plist(
     assert str(tmp_path / "cfg.toml") in content
 
 
-def test_install_linux_writes_systemd_unit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_install_linux_writes_systemd_unit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(install_mod, "default_stdout_log", lambda: tmp_path / "out.log")
     monkeypatch.setattr(install_mod, "default_stderr_log", lambda: tmp_path / "err.log")
@@ -185,9 +186,7 @@ def test_install_linux_writes_systemd_unit(
     assert "Restart=on-failure" in content
 
 
-def test_install_windows_writes_task_xml(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_install_windows_writes_task_xml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     localappdata = tmp_path / "LocalAppData"
     monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
     monkeypatch.setattr(install_mod, "default_stdout_log", lambda: tmp_path / "out.log")
@@ -240,12 +239,12 @@ def test_install_rejects_non_at_login() -> None:
 # ── uninstall_autostart ──────────────────────────────────────────────────────
 
 
-def test_uninstall_removes_rendered_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_uninstall_removes_rendered_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(install_mod, "default_stdout_log", lambda: tmp_path / "out.log")
     monkeypatch.setattr(install_mod, "default_stderr_log", lambda: tmp_path / "err.log")
-    monkeypatch.setattr(install_mod, "resolve_shim_executable", lambda: "/usr/local/bin/autogpt-shim")
+    monkeypatch.setattr(
+        install_mod, "resolve_shim_executable", lambda: "/usr/local/bin/autogpt-shim"
+    )
     with _patch_platform("darwin"):
         install_mod.install_autostart(home=tmp_path)
         target = tmp_path / "Library" / "LaunchAgents" / "net.autogpt.shim.plist"
@@ -255,9 +254,7 @@ def test_uninstall_removes_rendered_file(
     assert status.installed is False
 
 
-def test_uninstall_is_idempotent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_uninstall_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with _patch_platform("darwin"):
         status1 = install_mod.uninstall_autostart(home=tmp_path)
         status2 = install_mod.uninstall_autostart(home=tmp_path)
@@ -271,18 +268,16 @@ def test_uninstall_is_idempotent(
 def test_status_when_absent(tmp_path: Path) -> None:
     status = install_mod.status_for("darwin", home=tmp_path)
     assert status.installed is False
-    assert status.target_path == (
-        tmp_path / "Library" / "LaunchAgents" / "net.autogpt.shim.plist"
-    )
+    assert status.target_path == (tmp_path / "Library" / "LaunchAgents" / "net.autogpt.shim.plist")
     assert status.enable_command and "launchctl load" in status.enable_command
 
 
-def test_status_when_present_macos(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_status_when_present_macos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(install_mod, "default_stdout_log", lambda: tmp_path / "out.log")
     monkeypatch.setattr(install_mod, "default_stderr_log", lambda: tmp_path / "err.log")
-    monkeypatch.setattr(install_mod, "resolve_shim_executable", lambda: "/usr/local/bin/autogpt-shim")
+    monkeypatch.setattr(
+        install_mod, "resolve_shim_executable", lambda: "/usr/local/bin/autogpt-shim"
+    )
     with _patch_platform("darwin"):
         install_mod.install_autostart(home=tmp_path)
     status = install_mod.status_for("darwin", home=tmp_path)

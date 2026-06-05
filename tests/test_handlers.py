@@ -103,7 +103,9 @@ async def test_read_base64_path(tmp_path: Path) -> None:
     h = FileHandler(make_config(tmp_path))
     raw = bytes(range(256))
     (tmp_path / "bin.dat").write_bytes(raw)
-    resp = await h.handle_read(_read_msg(tmp_path / "bin.dat", encoding=Encoding.BASE64, format=FileFormat.BYTES))
+    resp = await h.handle_read(
+        _read_msg(tmp_path / "bin.dat", encoding=Encoding.BASE64, format=FileFormat.BYTES)
+    )
     assert isinstance(resp, FileContentsMessage)
     assert resp.payload.encoding == Encoding.BASE64
     assert base64.b64decode(resp.payload.content) == raw
@@ -175,7 +177,9 @@ async def test_stat_file(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_stat_missing_returns_exists_false(tmp_path: Path) -> None:
     h = FileHandler(make_config(tmp_path))
-    msg = FileStatMessage(id=new_id(), ts=now_ts(), payload=FileStatPayload(path=str(tmp_path / "nope")))
+    msg = FileStatMessage(
+        id=new_id(), ts=now_ts(), payload=FileStatPayload(path=str(tmp_path / "nope"))
+    )
     resp = await h.handle_stat(msg)
     assert isinstance(resp, FileStatResponseMessage)
     assert resp.payload.exists is False
@@ -269,7 +273,9 @@ async def test_delete_file(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_delete_missing_without_missing_ok(tmp_path: Path) -> None:
     h = FileHandler(make_config(tmp_path))
-    msg = FileDeleteMessage(id=new_id(), ts=now_ts(), payload=FileDeletePayload(path=str(tmp_path / "nope")))
+    msg = FileDeleteMessage(
+        id=new_id(), ts=now_ts(), payload=FileDeletePayload(path=str(tmp_path / "nope"))
+    )
     resp = await h.handle_delete(msg)
     assert isinstance(resp, ErrorMessage)
     assert resp.payload.code == ErrorCode.PATH_NOT_FOUND

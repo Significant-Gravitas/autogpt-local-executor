@@ -106,7 +106,9 @@ def _normalize_for_compare(path: str) -> str:
     return path
 
 
-def is_inside_jail(requested_path: str | os.PathLike[str], allowed_root: str | os.PathLike[str]) -> bool:
+def is_inside_jail(
+    requested_path: str | os.PathLike[str], allowed_root: str | os.PathLike[str]
+) -> bool:
     """Return True iff `requested_path` resolves inside `allowed_root`.
 
     Faithful implementation of the algorithm in CROSS_PLATFORM.md "Path

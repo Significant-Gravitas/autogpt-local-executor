@@ -60,8 +60,7 @@ def main() -> None:
         "--enable-clipboard",
         action="store_true",
         default=False,
-        help="Permit CLIPBOARD_READ / CLIPBOARD_WRITE (default-deny; see "
-        "docs/COMPUTER_USE.md Q3).",
+        help="Permit CLIPBOARD_READ / CLIPBOARD_WRITE (default-deny; see docs/COMPUTER_USE.md Q3).",
     )
     start_p.add_argument(
         "--enable-clipboard-read-foreign",
@@ -432,9 +431,7 @@ def _audit_export(current: Path, output: Path | None) -> int:
         for path in files:
             data = path.read_bytes()
             digest = hashlib.sha256(data).hexdigest()
-            manifest["files"].append(
-                {"name": path.name, "size": len(data), "sha256": digest}
-            )
+            manifest["files"].append({"name": path.name, "size": len(data), "sha256": digest})
             zf.writestr(path.name, data)
         manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
         signature = hmac.new(key, manifest_bytes, hashlib.sha256).hexdigest()

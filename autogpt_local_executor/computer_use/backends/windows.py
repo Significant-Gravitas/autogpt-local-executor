@@ -108,9 +108,7 @@ class WindowsBackend(ComputerUseBackend):
             raise FeatureNotSupportedError("screenshot", reason=str(exc)) from exc
 
         if window_id is not None:
-            return self._screenshot_window(
-                window_id, quality=quality, format=format
-            )
+            return self._screenshot_window(window_id, quality=quality, format=format)
 
         displays = self.display_info()
         if not displays:
@@ -437,9 +435,7 @@ class WindowsBackend(ComputerUseBackend):
                     if not include_offscreen:
                         return
                 fp = WindowFingerprint(pid=pid, class_name=cls, creation_timestamp=None)
-                wid = self.window_registry.mint(
-                    hwnd, fp, extra={"bounds": (left, top, right, bot)}
-                )
+                wid = self.window_registry.mint(hwnd, fp, extra={"bounds": (left, top, right, bot)})
                 out.append(
                     WindowInfo(
                         window_id=wid,
@@ -573,11 +569,11 @@ class WindowsBackend(ComputerUseBackend):
 
     def clipboard_read(self, *, format: str = "text") -> ClipboardReadResult:
         if not self._clipboard_enabled:
-            raise FeatureNotSupportedError(
-                "clipboard.read", reason="--enable-clipboard not set"
-            )
+            raise FeatureNotSupportedError("clipboard.read", reason="--enable-clipboard not set")
         if format != "text":
-            raise FeatureNotSupportedError("clipboard.read", reason=f"format {format!r} not supported")
+            raise FeatureNotSupportedError(
+                "clipboard.read", reason=f"format {format!r} not supported"
+            )
 
         # Concealed check first.
         if self._has_private_format():
@@ -586,7 +582,9 @@ class WindowsBackend(ComputerUseBackend):
         text, seq = self._read_clipboard_text()
         if self._clipboard_read_foreign:
             content = text or ""
-            return ClipboardReadResult(format="text", content=content, size_bytes=len(content.encode("utf-8")))
+            return ClipboardReadResult(
+                format="text", content=content, size_bytes=len(content.encode("utf-8"))
+            )
 
         record = self.clipboard_writeback.check(live_content=text, live_sequence=seq)
         if record is None:
@@ -595,9 +593,7 @@ class WindowsBackend(ComputerUseBackend):
                 raise ClipboardConcealedError("writeback_only")
             age = snap.age()
             if age > self.clipboard_writeback.window_seconds:
-                raise ClipboardConcealedError(
-                    "writeback_only", writeback_age_seconds=age
-                )
+                raise ClipboardConcealedError("writeback_only", writeback_age_seconds=age)
             raise ClipboardConcealedError("writeback_overwritten")
         content = text or ""
         return ClipboardReadResult(
@@ -606,11 +602,11 @@ class WindowsBackend(ComputerUseBackend):
 
     def clipboard_write(self, *, format: str = "text", content: str) -> None:
         if not self._clipboard_enabled:
-            raise FeatureNotSupportedError(
-                "clipboard.write", reason="--enable-clipboard not set"
-            )
+            raise FeatureNotSupportedError("clipboard.write", reason="--enable-clipboard not set")
         if format != "text":
-            raise FeatureNotSupportedError("clipboard.write", reason=f"format {format!r} not supported")
+            raise FeatureNotSupportedError(
+                "clipboard.write", reason=f"format {format!r} not supported"
+            )
         seq = self._write_clipboard_text(content)
         self.clipboard_writeback.record_write(content, sequence=seq)
 

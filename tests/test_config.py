@@ -26,7 +26,7 @@ def test_load_config_with_toml_overrides(tmp_path: Path) -> None:
     toml_file = tmp_path / "config.toml"
     toml_file.write_text(
         'platform_url = "http://localhost:8000"\n'
-        'oauth_redirect_port = 42010\n'
+        "oauth_redirect_port = 42010\n"
         f'allowed_root = "{tmp_path}/ws"\n'
     )
     cfg = load_config(config_path=toml_file)
@@ -37,7 +37,7 @@ def test_load_config_with_toml_overrides(tmp_path: Path) -> None:
 
 def test_load_config_overrides_win(tmp_path: Path) -> None:
     toml_file = tmp_path / "config.toml"
-    toml_file.write_text('oauth_redirect_port = 42010\n')
+    toml_file.write_text("oauth_redirect_port = 42010\n")
     cfg = load_config(
         config_path=toml_file,
         overrides={"oauth_redirect_port": 42050},

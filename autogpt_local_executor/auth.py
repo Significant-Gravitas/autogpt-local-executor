@@ -52,7 +52,9 @@ class KeychainTokenStore:
         )
         await loop.run_in_executor(
             None,
-            lambda: keyring.set_password(KEYCHAIN_SERVICE, KEYCHAIN_REFRESH_TOKEN_KEY, refresh_token),
+            lambda: keyring.set_password(
+                KEYCHAIN_SERVICE, KEYCHAIN_REFRESH_TOKEN_KEY, refresh_token
+            ),
         )
 
     def clear_tokens(self) -> None:

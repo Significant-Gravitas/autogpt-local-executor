@@ -52,9 +52,7 @@ def test_doctor_returns_78_when_ax_denied_and_computer_use_requested(
     assert rc == doctor.EX_CONFIG
 
 
-def test_doctor_linux_wayland_warns_when_computer_use_on(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_doctor_linux_wayland_warns_when_computer_use_on(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(doctor.platform_info, "detect_platform", lambda: "linux")
     monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
     monkeypatch.setattr(
@@ -110,6 +108,7 @@ def test_daemon_preflight_raises_when_ax_denied_on_macos(tmp_path, monkeypatch) 
         lambda: "darwin",
     )
     import sys
+
     fake_appsvc = MagicMock()
     fake_appsvc.AXIsProcessTrusted = lambda: False
     monkeypatch.setitem(sys.modules, "ApplicationServices", fake_appsvc)
@@ -127,6 +126,7 @@ def test_daemon_preflight_passes_when_ax_granted_on_macos(tmp_path, monkeypatch)
         lambda: "darwin",
     )
     import sys
+
     fake_appsvc = MagicMock()
     fake_appsvc.AXIsProcessTrusted = lambda: True
     monkeypatch.setitem(sys.modules, "ApplicationServices", fake_appsvc)

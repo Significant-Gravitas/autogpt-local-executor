@@ -112,7 +112,12 @@ def _ok_result(duration_ms: int, *, exit_code: int | None = None) -> dict:
 
 
 def _err_result(duration_ms: int, error_code: str, *, exit_code: int | None = None) -> dict:
-    return {"ok": False, "exit_code": exit_code, "duration_ms": duration_ms, "error_code": error_code}
+    return {
+        "ok": False,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "error_code": error_code,
+    }
 
 
 def _elapsed_ms(start: float) -> int:
@@ -302,9 +307,7 @@ class CommandHandler:
             await self._terminate_tree(proc)
             try:
                 # Drain any remaining output without blocking long.
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=2.0
-                )
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2.0)
             except TimeoutError:
                 pass
             exit_code = proc.returncode if proc.returncode is not None else -1
@@ -428,9 +431,7 @@ class FileHandler:
 
     # -- FILE_READ -----------------------------------------------------------
 
-    async def handle_read(
-        self, msg: FileReadMessage
-    ) -> FileContentsMessage | ErrorMessage:
+    async def handle_read(self, msg: FileReadMessage) -> FileContentsMessage | ErrorMessage:
         payload = msg.payload
         start = time.monotonic()
         try:
@@ -447,14 +448,20 @@ class FileHandler:
         }
 
         if not path.exists():
-            await self._emit("FILE_READ", msg.id, {**details_base, "size_bytes_returned": 0},
-                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
-            return make_error(
-                msg.id, ErrorCode.PATH_NOT_FOUND, f"{path} does not exist"
+            await self._emit(
+                "FILE_READ",
+                msg.id,
+                {**details_base, "size_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value),
             )
+            return make_error(msg.id, ErrorCode.PATH_NOT_FOUND, f"{path} does not exist")
         if path.is_dir():
-            await self._emit("FILE_READ", msg.id, {**details_base, "size_bytes_returned": 0},
-                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
+            await self._emit(
+                "FILE_READ",
+                msg.id,
+                {**details_base, "size_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
             return make_error(
                 msg.id,
                 ErrorCode.INTERNAL_ERROR,
@@ -463,8 +470,12 @@ class FileHandler:
 
         size = path.stat().st_size
         if size > self.config.max_file_size_bytes:
-            await self._emit("FILE_READ", msg.id, {**details_base, "size_bytes_returned": 0},
-                             _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value))
+            await self._emit(
+                "FILE_READ",
+                msg.id,
+                {**details_base, "size_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value),
+            )
             return make_error(
                 msg.id,
                 ErrorCode.FILE_TOO_LARGE,
@@ -507,9 +518,7 @@ class FileHandler:
 
     # -- FILE_WRITE ----------------------------------------------------------
 
-    async def handle_write(
-        self, msg: FileWriteMessage
-    ) -> AckMessage | ErrorMessage:
+    async def handle_write(self, msg: FileWriteMessage) -> AckMessage | ErrorMessage:
         payload = msg.payload
         start = time.monotonic()
         try:
@@ -534,9 +543,7 @@ class FileHandler:
                     {**details_base, "size_bytes_written": 0},
                     _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
                 )
-                return make_error(
-                    msg.id, ErrorCode.INTERNAL_ERROR, f"Bad base64: {exc}"
-                )
+                return make_error(msg.id, ErrorCode.INTERNAL_ERROR, f"Bad base64: {exc}")
         else:
             raw = payload.content.encode("utf-8")
 
@@ -592,9 +599,7 @@ class FileHandler:
 
     # -- FILE_STAT -----------------------------------------------------------
 
-    async def handle_stat(
-        self, msg: FileStatMessage
-    ) -> FileStatResponseMessage | ErrorMessage:
+    async def handle_stat(self, msg: FileStatMessage) -> FileStatResponseMessage | ErrorMessage:
         payload = msg.payload
         start = time.monotonic()
         try:
@@ -620,8 +625,12 @@ class FileHandler:
                 payload=FileStatResponsePayload(exists=False),
             )
         except OSError as exc:
-            await self._emit("FILE_STAT", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
+            await self._emit(
+                "FILE_STAT",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
         is_file = stat.S_ISREG(st.st_mode)
@@ -674,9 +683,7 @@ class FileHandler:
 
     # -- FILE_LIST -----------------------------------------------------------
 
-    async def handle_list(
-        self, msg: FileListMessage
-    ) -> FileListResponseMessage | ErrorMessage:
+    async def handle_list(self, msg: FileListMessage) -> FileListResponseMessage | ErrorMessage:
         payload = msg.payload
         start = time.monotonic()
         try:
@@ -694,17 +701,21 @@ class FileHandler:
         }
 
         if not base.exists():
-            await self._emit("FILE_LIST", msg.id, {**details_base, "entries_returned": 0},
-                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
-            return make_error(
-                msg.id, ErrorCode.PATH_NOT_FOUND, f"{base} does not exist"
+            await self._emit(
+                "FILE_LIST",
+                msg.id,
+                {**details_base, "entries_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value),
             )
+            return make_error(msg.id, ErrorCode.PATH_NOT_FOUND, f"{base} does not exist")
         if not base.is_dir():
-            await self._emit("FILE_LIST", msg.id, {**details_base, "entries_returned": 0},
-                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
-            return make_error(
-                msg.id, ErrorCode.INTERNAL_ERROR, f"{base} is not a directory"
+            await self._emit(
+                "FILE_LIST",
+                msg.id,
+                {**details_base, "entries_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
             )
+            return make_error(msg.id, ErrorCode.INTERNAL_ERROR, f"{base} is not a directory")
 
         def _walk() -> tuple[list[FileEntry], bool]:
             entries: list[FileEntry] = []
@@ -764,9 +775,7 @@ class FileHandler:
 
     # -- FILE_DELETE ---------------------------------------------------------
 
-    async def handle_delete(
-        self, msg: FileDeleteMessage
-    ) -> AckMessage | ErrorMessage:
+    async def handle_delete(self, msg: FileDeleteMessage) -> AckMessage | ErrorMessage:
         payload = msg.payload
         start = time.monotonic()
         try:
@@ -785,11 +794,13 @@ class FileHandler:
             if payload.missing_ok:
                 await self._emit("FILE_DELETE", msg.id, details, _ok_result(_elapsed_ms(start)))
                 return make_ack(msg.id)
-            await self._emit("FILE_DELETE", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
-            return make_error(
-                msg.id, ErrorCode.PATH_NOT_FOUND, f"{path} does not exist"
+            await self._emit(
+                "FILE_DELETE",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value),
             )
+            return make_error(msg.id, ErrorCode.PATH_NOT_FOUND, f"{path} does not exist")
 
         try:
             if path.is_dir() and not path.is_symlink():
@@ -801,17 +812,21 @@ class FileHandler:
                     except OSError as exc:
                         # Dir not empty.
                         await self._emit(
-                            "FILE_DELETE", msg.id, details,
+                            "FILE_DELETE",
+                            msg.id,
+                            details,
                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_EMPTY.value),
                         )
-                        return make_error(
-                            msg.id, ErrorCode.PATH_NOT_EMPTY, str(exc)
-                        )
+                        return make_error(msg.id, ErrorCode.PATH_NOT_EMPTY, str(exc))
             else:
                 await asyncio.to_thread(os.unlink, str(path))
         except OSError as exc:
-            await self._emit("FILE_DELETE", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
+            await self._emit(
+                "FILE_DELETE",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
         await self._emit("FILE_DELETE", msg.id, details, _ok_result(_elapsed_ms(start)))
@@ -819,9 +834,7 @@ class FileHandler:
 
     # -- FILE_MOVE -----------------------------------------------------------
 
-    async def handle_move(
-        self, msg: FileMoveMessage
-    ) -> AckMessage | ErrorMessage:
+    async def handle_move(self, msg: FileMoveMessage) -> AckMessage | ErrorMessage:
         payload = msg.payload
         start = time.monotonic()
         try:
@@ -842,17 +855,21 @@ class FileHandler:
         details = {"src": str(src), "dst": str(dst), "overwrite": payload.overwrite}
 
         if not src.exists():
-            await self._emit("FILE_MOVE", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value))
-            return make_error(
-                msg.id, ErrorCode.PATH_NOT_FOUND, f"{src} does not exist"
+            await self._emit(
+                "FILE_MOVE",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.PATH_NOT_FOUND.value),
             )
+            return make_error(msg.id, ErrorCode.PATH_NOT_FOUND, f"{src} does not exist")
         if dst.exists() and not payload.overwrite:
-            await self._emit("FILE_MOVE", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.PATH_EXISTS.value))
-            return make_error(
-                msg.id, ErrorCode.PATH_EXISTS, f"{dst} already exists"
+            await self._emit(
+                "FILE_MOVE",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.PATH_EXISTS.value),
             )
+            return make_error(msg.id, ErrorCode.PATH_EXISTS, f"{dst} already exists")
 
         try:
             if dst.exists() and payload.overwrite:
@@ -863,8 +880,12 @@ class FileHandler:
             # shutil.move handles cross-device by falling back to copy+delete.
             await asyncio.to_thread(shutil.move, str(src), str(dst))
         except OSError as exc:
-            await self._emit("FILE_MOVE", msg.id, details,
-                             _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value))
+            await self._emit(
+                "FILE_MOVE",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
+            )
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
         await self._emit("FILE_MOVE", msg.id, details, _ok_result(_elapsed_ms(start)))
@@ -990,9 +1011,11 @@ class ComputerUseHandler:
         # Legacy test compatibility: when the old module-level pyautogui
         # mock is in place, honor it instead of the backend so existing
         # tests that monkey-patch h_mod._pyautogui keep working.
-        if _Image is not None and _pyautogui is not None and getattr(
-            _pyautogui, "_extract_mock_name", None
-        ) is not None:
+        if (
+            _Image is not None
+            and _pyautogui is not None
+            and getattr(_pyautogui, "_extract_mock_name", None) is not None
+        ):
             try:
                 buf = io.BytesIO()
                 img = _pyautogui.screenshot()
@@ -1068,9 +1091,7 @@ class ComputerUseHandler:
                 region=result.region,
                 display_scale=result.display_scale,
                 logical_size=result.logical_size,
-                meta=ScreenshotResponseMeta(
-                    origin=result.origin, display_id=result.display_id
-                ),
+                meta=ScreenshotResponseMeta(origin=result.origin, display_id=result.display_id),
             ),
         )
 
@@ -1142,9 +1163,7 @@ class ComputerUseHandler:
                 _err_result(_elapsed_ms(start), exc.code.value),
             )
             return self._to_wire_error(msg.id, exc)
-        await self._emit(
-            "CURSOR_POSITION_REQUEST", msg.id, {}, _ok_result(_elapsed_ms(start))
-        )
+        await self._emit("CURSOR_POSITION_REQUEST", msg.id, {}, _ok_result(_elapsed_ms(start)))
         return CursorPositionResponseMessage(
             id=msg.id,
             ts=now_ts(),
@@ -1309,9 +1328,7 @@ class ComputerUseHandler:
         start = time.monotonic()
         details = {"format": msg.payload.format}
         try:
-            result = await asyncio.to_thread(
-                self.backend.clipboard_read, format=msg.payload.format
-            )
+            result = await asyncio.to_thread(self.backend.clipboard_read, format=msg.payload.format)
         except BackendError as exc:
             await self._emit(
                 "CLIPBOARD_READ",
@@ -1362,9 +1379,7 @@ class ComputerUseHandler:
     async def _permissions_check(self, msg: PermissionsCheckRequestMessage) -> Any:
         start = time.monotonic()
         try:
-            perms = await asyncio.to_thread(
-                self.backend.permissions_check, msg.payload.permissions
-            )
+            perms = await asyncio.to_thread(self.backend.permissions_check, msg.payload.permissions)
         except BackendError as exc:
             await self._emit(
                 "PERMISSIONS_CHECK_REQUEST",

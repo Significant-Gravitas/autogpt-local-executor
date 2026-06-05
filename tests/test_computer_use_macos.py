@@ -112,14 +112,10 @@ def test_input_action_raises_on_out_of_bounds(tmp_path, displays_1080p, monkeypa
     with pytest.raises(InputOutOfBoundsError) as ei:
         b.input_action("left_click", coordinate=(10000, 10000))
     assert ei.value.details["requested_coordinate"] == [10000, 10000]
-    assert ei.value.details["displays"] == [
-        {"index": 0, "origin": [0, 0], "size": [1920, 1080]}
-    ]
+    assert ei.value.details["displays"] == [{"index": 0, "origin": [0, 0], "size": [1920, 1080]}]
 
 
-def test_input_action_in_bounds_on_secondary_display(
-    tmp_path, displays_dual, monkeypatch
-) -> None:
+def test_input_action_in_bounds_on_secondary_display(tmp_path, displays_dual, monkeypatch) -> None:
     b = MacOSBackend(_config(tmp_path))
     monkeypatch.setattr(b, "display_info", lambda: displays_dual)
     monkeypatch.setattr(b, "_ax_trusted", lambda: True)
@@ -218,9 +214,7 @@ def test_clipboard_writeback_only_refuses_foreign_content(tmp_path, monkeypatch)
 def test_clipboard_read_foreign_returns_user_content(tmp_path, monkeypatch) -> None:
     """With --enable-clipboard-read-foreign, foreign content is returned
     (subject to the concealed-type check)."""
-    b = MacOSBackend(
-        _config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True)
-    )
+    b = MacOSBackend(_config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True))
     monkeypatch.setattr(b, "_read_pasteboard_text", lambda: ("user_text", 99))
     monkeypatch.setattr(b, "_read_pasteboard_types", lambda: [])
     res = b.clipboard_read()
@@ -230,9 +224,7 @@ def test_clipboard_read_foreign_returns_user_content(tmp_path, monkeypatch) -> N
 def test_clipboard_read_refuses_concealed_type(tmp_path, monkeypatch) -> None:
     """ConcealedType marker on the pasteboard → refuse even with
     --enable-clipboard-read-foreign."""
-    b = MacOSBackend(
-        _config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True)
-    )
+    b = MacOSBackend(_config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True))
     monkeypatch.setattr(b, "_read_pasteboard_text", lambda: ("secret", 1))
     marker = next(iter(CONCEALED_PB_TYPES))
     monkeypatch.setattr(b, "_read_pasteboard_types", lambda: [marker])

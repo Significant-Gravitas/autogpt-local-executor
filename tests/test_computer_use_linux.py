@@ -128,9 +128,7 @@ def test_window_list_with_wmctrl_parses_output(tmp_path, monkeypatch) -> None:
         "0x01000003  0 12345 100 100 800 600 host  Terminal\n"
         "0x02000004  0 67890 900 100 600 400 host  Firefox\n"
     )
-    monkeypatch.setattr(
-        linux_backend.subprocess, "check_output", lambda *a, **kw: sample
-    )
+    monkeypatch.setattr(linux_backend.subprocess, "check_output", lambda *a, **kw: sample)
     out = b.window_list()
     assert len(out) == 2
     assert out[0].pid == 12345
@@ -173,9 +171,7 @@ def test_clipboard_writeback_only_refuses_foreign(tmp_path, monkeypatch) -> None
 
 def test_clipboard_read_foreign_returns_content(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(linux_backend.shutil, "which", lambda n: "/usr/bin/" + n)
-    b = LinuxBackend(
-        _config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True)
-    )
+    b = LinuxBackend(_config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True))
     monkeypatch.setattr(b, "_read_clipboard_text", lambda: ("user_text", None))
     res = b.clipboard_read()
     assert res.content == "user_text"

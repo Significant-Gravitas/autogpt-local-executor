@@ -36,7 +36,13 @@ def _default_config_path() -> Path:
         base = Path(_os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
         return base / "autogpt-local-executor" / "config.toml"
     if plat == "darwin":
-        return Path.home() / "Library" / "Application Support" / "autogpt-local-executor" / "config.toml"
+        return (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "autogpt-local-executor"
+            / "config.toml"
+        )
     # linux / wsl2
     import os as _os
 

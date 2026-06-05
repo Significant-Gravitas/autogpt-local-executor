@@ -101,8 +101,7 @@ class InputOutOfBoundsError(BackendError):
         displays: list[dict[str, Any]],
     ) -> None:
         super().__init__(
-            f"coordinate {tuple(coordinate)} is outside the union of "
-            "connected display bounds",
+            f"coordinate {tuple(coordinate)} is outside the union of connected display bounds",
             details={
                 "requested_coordinate": list(coordinate),
                 "displays": displays,

@@ -67,7 +67,9 @@ def test_detect_capabilities_omits_shell_when_disabled() -> None:
 
 def test_default_allowed_root_per_os(monkeypatch: pytest.MonkeyPatch) -> None:
     with patch.object(platform_info, "detect_platform", return_value="darwin"):
-        assert platform_info.default_allowed_root() == Path.home() / "Documents" / "autogpt-workspace"
+        assert (
+            platform_info.default_allowed_root() == Path.home() / "Documents" / "autogpt-workspace"
+        )
     with patch.object(platform_info, "detect_platform", return_value="linux"):
         assert platform_info.default_allowed_root() == Path.home() / "autogpt-workspace"
     with patch.object(platform_info, "detect_platform", return_value="windows"):

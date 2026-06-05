@@ -63,8 +63,14 @@ async def test_round_trip_100_records_verifies_clean(tmp_path: Path) -> None:
         await w.write(
             "EXECUTE_COMMAND",
             request_id=f"req-{i}",
-            details={"command": f"echo {i}", "argv": None, "shell": "auto",
-                     "cwd": "/tmp", "env_keys": [], "timeout_seconds": 30},
+            details={
+                "command": f"echo {i}",
+                "argv": None,
+                "shell": "auto",
+                "cwd": "/tmp",
+                "env_keys": [],
+                "timeout_seconds": 30,
+            },
             result={"ok": True, "exit_code": 0, "duration_ms": 1, "error_code": None},
         )
     violations = AuditWriter.verify(w.path, KEY)
@@ -309,8 +315,10 @@ def test_get_or_create_audit_key_round_trips_via_keyring() -> None:
 
     import keyring
 
-    with patch.object(keyring, "get_password", side_effect=fake_get), \
-         patch.object(keyring, "set_password", side_effect=fake_set):
+    with (
+        patch.object(keyring, "get_password", side_effect=fake_get),
+        patch.object(keyring, "set_password", side_effect=fake_set),
+    ):
         first = get_or_create_audit_key()
         second = get_or_create_audit_key()
     assert first == second
@@ -328,8 +336,10 @@ def test_get_or_create_audit_key_regenerates_when_stored_value_corrupt() -> None
 
     import keyring
 
-    with patch.object(keyring, "get_password", side_effect=fake_get), \
-         patch.object(keyring, "set_password", side_effect=fake_set):
+    with (
+        patch.object(keyring, "get_password", side_effect=fake_get),
+        patch.object(keyring, "set_password", side_effect=fake_set),
+    ):
         key = get_or_create_audit_key()
     assert len(key) == 32
     assert store[("autogpt-local-executor", "audit_key")] == key.hex()

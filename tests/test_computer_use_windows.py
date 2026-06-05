@@ -112,9 +112,7 @@ def test_clipboard_disabled_returns_feature_not_supported(tmp_path) -> None:
 def test_clipboard_cf_private_marker_raises_concealed(tmp_path, monkeypatch) -> None:
     """Q3: CF_PRIVATE format on the clipboard → CLIPBOARD_CONCEALED with
     marker=CF_PRIVATE."""
-    b = WindowsBackend(
-        _config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True)
-    )
+    b = WindowsBackend(_config(tmp_path, enable_clipboard=True, enable_clipboard_read_foreign=True))
     monkeypatch.setattr(b, "_has_private_format", lambda: True)
     monkeypatch.setattr(b, "_read_clipboard_text", lambda: ("secret", 1))
     with pytest.raises(ClipboardConcealedError) as ei:

@@ -80,9 +80,7 @@ def _check_allowed_root(config: ShimConfig) -> CheckResult:
                 blocking=True,
             )
     except OSError as exc:
-        return CheckResult(
-            "FAIL", "allowed_root", f"{p}: {exc}", blocking=True
-        )
+        return CheckResult("FAIL", "allowed_root", f"{p}: {exc}", blocking=True)
     return CheckResult("OK", "allowed_root", f"{p} exists, writable")
 
 
@@ -108,9 +106,7 @@ def _check_display(config: ShimConfig) -> CheckResult:
         displays = backend.display_info()
         if not displays:
             return CheckResult("WARN", "display", "no displays detected")
-        desc = " + ".join(
-            f"{d.physical_size[0]}x{d.physical_size[1]}" for d in displays
-        )
+        desc = " + ".join(f"{d.physical_size[0]}x{d.physical_size[1]}" for d in displays)
         return CheckResult("OK", "display", f"{len(displays)} display(s): {desc}")
     except Exception as exc:
         return CheckResult("WARN", "display", f"could not enumerate: {exc}")
@@ -244,8 +240,7 @@ def _check_linux(config: ShimConfig, *, is_wsl2: bool) -> list[CheckResult]:
             CheckResult(
                 "WARN",
                 "display_server",
-                "WSL2 has no display server reachable to the Windows host; "
-                "computer_use disabled",
+                "WSL2 has no display server reachable to the Windows host; computer_use disabled",
                 blocking=config.enable_computer_use,
             )
         )

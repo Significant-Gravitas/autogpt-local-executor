@@ -76,7 +76,13 @@ class LinuxBackend(ComputerUseBackend):
 
     def features(self) -> list[str]:
         if self._wayland:
-            return ["screenshot.region", "display.info", "app.list", "app.launch", "permissions.check"]
+            return [
+                "screenshot.region",
+                "display.info",
+                "app.list",
+                "app.launch",
+                "permissions.check",
+            ]
         feats = [
             "screenshot.region",
             "input.click.modifiers",
@@ -383,9 +389,7 @@ class LinuxBackend(ComputerUseBackend):
             except ValueError:
                 continue
             fp = WindowFingerprint(pid=pid, class_name=None, creation_timestamp=None)
-            wid = self.window_registry.mint(
-                native_id, fp, extra={"bounds": (x, y, x + w, y + h)}
-            )
+            wid = self.window_registry.mint(native_id, fp, extra={"bounds": (x, y, x + w, y + h)})
             out.append(
                 WindowInfo(
                     window_id=wid,
@@ -406,9 +410,7 @@ class LinuxBackend(ComputerUseBackend):
         if not self._has_wmctrl:
             return None
         try:
-            out = subprocess.check_output(
-                ["wmctrl", "-l", "-p"], text=True, timeout=5
-            )
+            out = subprocess.check_output(["wmctrl", "-l", "-p"], text=True, timeout=5)
             for line in out.splitlines():
                 parts = line.split(None, 4)
                 if len(parts) < 4:
@@ -493,18 +495,14 @@ class LinuxBackend(ComputerUseBackend):
             raise FeatureNotSupportedError(
                 "app.launch", reason=".desktop launch needs gtk-launch or dex"
             )
-        proc = subprocess.Popen(
-            [executable_path, *(args or [])], start_new_session=True
-        )
+        proc = subprocess.Popen([executable_path, *(args or [])], start_new_session=True)
         return proc.pid
 
     # ── Clipboard ────────────────────────────────────────────────────
 
     def clipboard_read(self, *, format: str = "text") -> ClipboardReadResult:
         if not self._clipboard_enabled:
-            raise FeatureNotSupportedError(
-                "clipboard.read", reason="--enable-clipboard not set"
-            )
+            raise FeatureNotSupportedError("clipboard.read", reason="--enable-clipboard not set")
         if format != "text":
             raise FeatureNotSupportedError(
                 "clipboard.read", reason=f"format {format!r} not supported"
@@ -512,7 +510,9 @@ class LinuxBackend(ComputerUseBackend):
         text, seq = self._read_clipboard_text()
         if self._clipboard_read_foreign:
             content = text or ""
-            return ClipboardReadResult(format="text", content=content, size_bytes=len(content.encode("utf-8")))
+            return ClipboardReadResult(
+                format="text", content=content, size_bytes=len(content.encode("utf-8"))
+            )
 
         record = self.clipboard_writeback.check(live_content=text, live_sequence=seq)
         if record is None:
@@ -521,9 +521,7 @@ class LinuxBackend(ComputerUseBackend):
                 raise ClipboardConcealedError("writeback_only")
             age = snap.age()
             if age > self.clipboard_writeback.window_seconds:
-                raise ClipboardConcealedError(
-                    "writeback_only", writeback_age_seconds=age
-                )
+                raise ClipboardConcealedError("writeback_only", writeback_age_seconds=age)
             raise ClipboardConcealedError("writeback_overwritten")
         content = text or ""
         return ClipboardReadResult(
@@ -532,9 +530,7 @@ class LinuxBackend(ComputerUseBackend):
 
     def clipboard_write(self, *, format: str = "text", content: str) -> None:
         if not self._clipboard_enabled:
-            raise FeatureNotSupportedError(
-                "clipboard.write", reason="--enable-clipboard not set"
-            )
+            raise FeatureNotSupportedError("clipboard.write", reason="--enable-clipboard not set")
         if format != "text":
             raise FeatureNotSupportedError(
                 "clipboard.write", reason=f"format {format!r} not supported"
@@ -551,9 +547,7 @@ class LinuxBackend(ComputerUseBackend):
                 return None, None
         if self._has_xclip:
             try:
-                out = subprocess.check_output(
-                    ["xclip", "-selection", "clipboard", "-o"], timeout=2
-                )
+                out = subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], timeout=2)
                 return out.decode("utf-8", errors="replace"), None
             except Exception:
                 return None, None
@@ -562,9 +556,7 @@ class LinuxBackend(ComputerUseBackend):
     def _write_clipboard_text(self, content: str) -> int | None:
         if self._wayland and self._has_wlcopy:
             try:
-                subprocess.run(
-                    ["wl-copy"], input=content.encode("utf-8"), check=True, timeout=2
-                )
+                subprocess.run(["wl-copy"], input=content.encode("utf-8"), check=True, timeout=2)
                 return None
             except Exception:
                 return None

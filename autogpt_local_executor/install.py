@@ -258,8 +258,7 @@ def status_for(platform_name: str, home: Path | None = None) -> AutostartStatus:
             )
         else:
             notes = notes + (
-                "For start-without-login on headless boxes: "
-                "`loginctl enable-linger $USER`.",
+                "For start-without-login on headless boxes: `loginctl enable-linger $USER`.",
             )
         return AutostartStatus(
             platform=platform_name,
@@ -274,10 +273,7 @@ def status_for(platform_name: str, home: Path | None = None) -> AutostartStatus:
             platform=platform_name,
             target_path=target,
             installed=installed,
-            enable_command=(
-                f'schtasks /Create /TN "{TASKSCHED_TASK_NAME}" '
-                f'/XML "{target}"'
-            ),
+            enable_command=(f'schtasks /Create /TN "{TASKSCHED_TASK_NAME}" /XML "{target}"'),
             disable_command=f'schtasks /Delete /TN "{TASKSCHED_TASK_NAME}" /F',
             notes=(
                 "Task Scheduler XML is written but NOT registered. Run the "

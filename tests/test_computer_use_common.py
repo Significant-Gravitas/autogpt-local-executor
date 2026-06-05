@@ -373,9 +373,7 @@ async def test_dispatch_clipboard_concealed_passthrough(tmp_path: Path) -> None:
 async def test_dispatch_feature_not_supported_passthrough(tmp_path: Path) -> None:
     handler = ComputerUseHandler(make_config(tmp_path))
     fb = attach_fake(handler)
-    fb.window_list.side_effect = FeatureNotSupportedError(
-        "window.list", reason="Wayland session"
-    )
+    fb.window_list.side_effect = FeatureNotSupportedError("window.list", reason="Wayland session")
     msg = WindowListRequestMessage(id=new_id(), ts=now_ts())
     resp = await handler.handle(msg)
     assert isinstance(resp, ErrorMessage)
@@ -454,9 +452,7 @@ async def test_permissions_check_response(tmp_path: Path) -> None:
     msg = PermissionsCheckRequestMessage(
         id=new_id(),
         ts=now_ts(),
-        payload=PermissionsCheckRequestPayload(
-            permissions=["accessibility", "screen_recording"]
-        ),
+        payload=PermissionsCheckRequestPayload(permissions=["accessibility", "screen_recording"]),
     )
     resp = await handler.handle(msg)
     assert resp.payload.permissions["accessibility"] == "denied"

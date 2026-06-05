@@ -103,10 +103,7 @@ def _canonicalize(value: Any) -> str:
         items = sorted(value.items(), key=lambda kv: kv[0])
         return (
             "{"
-            + ",".join(
-                f"{json.dumps(k, ensure_ascii=False)}:{_canonicalize(v)}"
-                for k, v in items
-            )
+            + ",".join(f"{json.dumps(k, ensure_ascii=False)}:{_canonicalize(v)}" for k, v in items)
             + "}"
         )
     raise TypeError(f"Cannot canonicalize {type(value)!r}")
@@ -408,16 +405,12 @@ class AuditWriter:
             try:
                 rec = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                violations.append(
-                    Violation("parse_error", None, f"unparseable line: {exc}")
-                )
+                violations.append(Violation("parse_error", None, f"unparseable line: {exc}"))
                 # Can't continue the chain past an unparseable record.
                 return violations
             seq = rec.get("seq")
             if not isinstance(seq, int):
-                violations.append(
-                    Violation("missing_field", None, "record missing seq")
-                )
+                violations.append(Violation("missing_field", None, "record missing seq"))
                 return violations
             if seq != expected_seq:
                 violations.append(
@@ -438,9 +431,7 @@ class AuditWriter:
                 )
             stored_hmac = rec.get("hmac")
             if not isinstance(stored_hmac, str):
-                violations.append(
-                    Violation("missing_field", seq, "record missing hmac")
-                )
+                violations.append(Violation("missing_field", seq, "record missing hmac"))
                 return violations
             shadow = {k: v for k, v in rec.items() if k != "hmac"}
             actual = hmac.new(audit_key, canonical_bytes(shadow), sha256).hexdigest()
@@ -476,9 +467,7 @@ def get_or_create_audit_key() -> bytes:
             try:
                 return bytes.fromhex(stored)
             except ValueError:
-                logger.warning(
-                    "Stored audit key in keychain is not hex; regenerating."
-                )
+                logger.warning("Stored audit key in keychain is not hex; regenerating.")
         key = secrets.token_bytes(32)
         keyring.set_password(KEYCHAIN_SERVICE, KEYCHAIN_AUDIT_KEY_USERNAME, key.hex())
         return key
@@ -558,6 +547,7 @@ def _xor_decrypt(passphrase: str, salt: bytes, ciphertext: bytes) -> bytes:
 def _detect_shim_version() -> str:
     try:
         from . import __version__  # late import to avoid cycle on cold start
+
         return __version__
     except Exception:
         return "0.0.0"
@@ -567,6 +557,7 @@ def _now_ts() -> float:
     # Plain wall clock; the spec calls for unix epoch seconds. Tests can
     # monkeypatch this if they need determinism.
     import time
+
     return time.time()
 
 

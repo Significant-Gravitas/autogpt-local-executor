@@ -273,6 +273,7 @@ class MacOSBackend(ComputerUseBackend):
                 NSBitmapImageRep,
                 NSPNGFileType,
             )
+
             rep = NSBitmapImageRep.alloc().initWithCGImage_(ref)
             png_data = rep.representationUsingType_properties_(NSPNGFileType, {})
             bytes_data = bytes(png_data)
@@ -487,9 +488,7 @@ class MacOSBackend(ComputerUseBackend):
                 logical_h = int(bounds.size.height)
                 physical_w = int(CGDisplayPixelsWide(did))
                 physical_h = int(CGDisplayPixelsHigh(did))
-                scale = (
-                    round(physical_w / logical_w, 2) if logical_w else 1.0
-                )
+                scale = round(physical_w / logical_w, 2) if logical_w else 1.0
                 out.append(
                     DisplayMonitor(
                         index=i,
@@ -590,9 +589,7 @@ class MacOSBackend(ComputerUseBackend):
                 kCGWindowListOptionIncludingWindow,
             )
 
-            info = CGWindowListCopyWindowInfo(
-                kCGWindowListOptionIncludingWindow, int(cg_window_id)
-            )
+            info = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, int(cg_window_id))
             if not info:
                 return None
             entry = info[0]
@@ -740,9 +737,7 @@ class MacOSBackend(ComputerUseBackend):
 
     def clipboard_read(self, *, format: str = "text") -> ClipboardReadResult:
         if not self._clipboard_enabled:
-            raise FeatureNotSupportedError(
-                "clipboard.read", reason="--enable-clipboard not set"
-            )
+            raise FeatureNotSupportedError("clipboard.read", reason="--enable-clipboard not set")
         if format != "text":
             raise FeatureNotSupportedError(
                 "clipboard.read",
@@ -754,26 +749,25 @@ class MacOSBackend(ComputerUseBackend):
         for c in CONCEALED_PB_TYPES:
             if c in markers:
                 raise ClipboardConcealedError(
-                    "concealed_type", marker=c,
+                    "concealed_type",
+                    marker=c,
                 )
 
         if self._clipboard_read_foreign:
             content = text or ""
-            return ClipboardReadResult(format="text", content=content, size_bytes=len(content.encode("utf-8")))
+            return ClipboardReadResult(
+                format="text", content=content, size_bytes=len(content.encode("utf-8"))
+            )
 
         # Default (writeback-only) — must match an in-window record.
-        record = self.clipboard_writeback.check(
-            live_content=text, live_sequence=seq
-        )
+        record = self.clipboard_writeback.check(live_content=text, live_sequence=seq)
         if record is None:
             snap = self.clipboard_writeback.snapshot()
             if snap is None:
                 raise ClipboardConcealedError("writeback_only")
             age = snap.age()
             if age > self.clipboard_writeback.window_seconds:
-                raise ClipboardConcealedError(
-                    "writeback_only", writeback_age_seconds=age
-                )
+                raise ClipboardConcealedError("writeback_only", writeback_age_seconds=age)
             raise ClipboardConcealedError("writeback_overwritten")
         content = text or ""
         return ClipboardReadResult(
@@ -782,9 +776,7 @@ class MacOSBackend(ComputerUseBackend):
 
     def clipboard_write(self, *, format: str = "text", content: str) -> None:
         if not self._clipboard_enabled:
-            raise FeatureNotSupportedError(
-                "clipboard.write", reason="--enable-clipboard not set"
-            )
+            raise FeatureNotSupportedError("clipboard.write", reason="--enable-clipboard not set")
         if format != "text":
             raise FeatureNotSupportedError(
                 "clipboard.write", reason=f"format {format!r} not supported in v1"

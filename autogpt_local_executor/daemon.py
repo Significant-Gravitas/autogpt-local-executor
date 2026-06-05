@@ -51,6 +51,7 @@ from .protocol import (
     PingMessage,
     ProtocolVersionMismatch,
     ScreenshotRequestMessage,
+    SessionRevokedMessage,
     WindowFocusMessage,
     WindowListRequestMessage,
     dump_message,
@@ -65,6 +66,27 @@ from .protocol import (
 # WebSocket close codes the platform may use to signal structured failures.
 # Mirrors docs/PROTOCOL.md → Close codes. Application-range (4000-4999).
 WS_CLOSE_PROTOCOL_VERSION_MISMATCH = 4426
+WS_CLOSE_SESSION_TAKEN_OVER = 4427
+WS_CLOSE_SESSION_REVOKED = 4428
+WS_CLOSE_PLATFORM_SHUTDOWN = 4429
+
+# Close codes the shim treats as fatal: after receiving them on the WS,
+# the shim MUST NOT auto-reconnect. Operator must restart.
+_FATAL_CLOSE_CODES: frozenset[int] = frozenset(
+    {
+        WS_CLOSE_PROTOCOL_VERSION_MISMATCH,
+        WS_CLOSE_SESSION_TAKEN_OVER,
+        WS_CLOSE_SESSION_REVOKED,
+        WS_CLOSE_PLATFORM_SHUTDOWN,
+    }
+)
+
+_CLOSE_CODE_LABELS: dict[int, str] = {
+    WS_CLOSE_PROTOCOL_VERSION_MISMATCH: "PROTOCOL_VERSION_MISMATCH",
+    WS_CLOSE_SESSION_TAKEN_OVER: "SESSION_TAKEN_OVER",
+    WS_CLOSE_SESSION_REVOKED: "SESSION_REVOKED",
+    WS_CLOSE_PLATFORM_SHUTDOWN: "PLATFORM_SHUTDOWN",
+}
 
 
 class DaemonPreflightError(RuntimeError):
@@ -256,6 +278,32 @@ class ShimDaemon:
             try:
                 async for raw in ws:
                     await self._on_frame(ws, raw)
+            except websockets.exceptions.ConnectionClosed as exc:
+                # Translate fatal application close codes into the
+                # _disable_reconnect flag so run() doesn't loop on us.
+                # Prefer the new rcvd.code (websockets >=13.1) and fall
+                # back to the deprecated attribute on older versions.
+                code: int | None
+                rcvd = getattr(exc, "rcvd", None)
+                if rcvd is not None and getattr(rcvd, "code", None) is not None:
+                    code = int(rcvd.code)
+                else:
+                    code = getattr(exc, "code", None)
+                label = _CLOSE_CODE_LABELS.get(code or -1, "unknown")
+                disconnect_reason = f"ws_closed_{code}_{label}"
+                if code in _FATAL_CLOSE_CODES:
+                    logger.warning(
+                        "WebSocket closed with fatal code %s (%s); will not auto-reconnect.",
+                        code,
+                        label,
+                    )
+                    self._disable_reconnect = True
+                    await self._audit_session_revoked(
+                        reason=label.lower(),
+                        source="ws_close_code",
+                        close_code=code,
+                    )
+                raise
             except Exception as exc:
                 disconnect_reason = f"loop_error: {exc.__class__.__name__}"
                 raise
@@ -410,11 +458,71 @@ class ShimDaemon:
                 logger.debug("Failed to send PONG", exc_info=True)
             return
 
+        # SESSION_REVOKED is a one-shot lifecycle event. We audit it, send
+        # nothing further, gracefully close, and disable auto-reconnect.
+        if isinstance(msg, SessionRevokedMessage):
+            await self._handle_session_revoked(ws, msg)
+            return
+
         if self._semaphore is None:
             # We somehow got a request before HELLO_ACK; be defensive.
             self._semaphore = asyncio.Semaphore(self.config.max_concurrent)
 
         asyncio.create_task(self._dispatch(ws, msg))
+
+    async def _handle_session_revoked(
+        self, ws, msg: SessionRevokedMessage
+    ) -> None:
+        """Per PROTOCOL.md → Session ownership: log, stop sending, close,
+        and don't auto-reconnect."""
+        reason = msg.payload.reason
+        new_machine = msg.payload.new_shim_machine_id
+        logger.warning(
+            "SESSION_REVOKED received (reason=%s, new_shim_machine_id=%s); "
+            "closing connection without retry.",
+            reason,
+            new_machine,
+        )
+        self._disable_reconnect = True
+        await self._audit_session_revoked(
+            reason=reason,
+            source="frame",
+            new_shim_machine_id=new_machine,
+        )
+        try:
+            # We send no further protocol frames; just close cleanly.
+            await ws.close(code=WS_CLOSE_SESSION_REVOKED, reason="session_revoked")
+        except Exception:
+            logger.debug("ws.close after SESSION_REVOKED failed", exc_info=True)
+
+    async def _audit_session_revoked(
+        self,
+        *,
+        reason: str,
+        source: str,
+        close_code: int | None = None,
+        new_shim_machine_id: str | None = None,
+    ) -> None:
+        """Emit a structured audit record for session revocation. Best-effort —
+        a failure here must not block close."""
+        if self.audit is None:
+            return
+        details: dict[str, Any] = {
+            "reason": reason,
+            "source": source,
+        }
+        if close_code is not None:
+            details["close_code"] = close_code
+        if new_shim_machine_id is not None:
+            details["new_shim_machine_id"] = new_shim_machine_id
+        try:
+            await self.audit.write(
+                "SESSION_REVOKED",
+                request_id=None,
+                details=details,
+            )
+        except Exception:
+            logger.debug("SESSION_REVOKED audit emit failed", exc_info=True)
 
     async def _dispatch(self, ws, msg: Any) -> None:
         assert self._semaphore is not None

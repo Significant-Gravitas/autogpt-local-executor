@@ -643,6 +643,77 @@ Platform sends `PING` every 30s. Shim must respond with `PONG` within 10s or con
 
 ---
 
+### Session ownership
+
+The platform owns at most one active WebSocket per `session_id`. Two shims
+trying to claim the same `session_id` (e.g. the same user starting
+`autogpt-shim start` on two laptops with the same auth) is a real concern
+— the v0 spec was silent on it and the platform did silent last-write-wins,
+orphaning the prior shim's pending requests with no clean error.
+
+#### Policy
+
+- **First connecting shim wins ownership** until it explicitly disconnects
+  OR the platform sends `SESSION_REVOKED`.
+- A second shim from the **SAME `machine_id`** is treated as a re-connect
+  (legitimate takeover — laptop sleep/wake, etc.). The platform serves
+  `SESSION_REVOKED` to the old shim with reason `another_shim_connected`
+  and accepts the new one.
+- A second shim from a **DIFFERENT `machine_id`** is REJECTED with WS
+  close code **4427** (`SESSION_TAKEN_OVER`) and a structured reason. The
+  rejected shim MUST NOT auto-reconnect. Rationale: avoid silent
+  split-brain where two machines both try to execute one Claude turn —
+  the file-system / window state diverges, audit chains fork, and the
+  platform can't meaningfully retry a half-finished command on the "other"
+  shim.
+
+#### `SESSION_REVOKED` (platform → shim)
+```json
+{
+  "type": "SESSION_REVOKED",
+  "id": "uuid",
+  "ts": 1234567890.0,
+  "version": "1.0",
+  "payload": {
+    "reason": "another_shim_connected",   // | "user_revoked" | "platform_shutdown"
+    "new_shim_machine_id": "macbook-air-7f3c"   // optional, set when reason is another_shim_connected
+  }
+}
+```
+
+On receipt the shim MUST:
+
+1. Log a `SESSION_REVOKED` audit event with the reason and source.
+2. Send no further frames on this connection.
+3. Gracefully close its half of the WebSocket (close code 4428 from the
+   shim side is acceptable; receivers tolerate any clean close after
+   `SESSION_REVOKED`).
+4. **NOT auto-reconnect** to the same session_id. Operator restart is
+   required to re-establish the session deliberately.
+
+Receivers MUST tolerate unknown future `reason` values (forward-compatible
+minor extension); the spec table above is the v1.0 set.
+
+#### WS close-code table
+
+| Code | Label | Meaning | Sender | Shim auto-reconnect? |
+|---|---|---|---|---|
+| 4426 | `PROTOCOL_VERSION_MISMATCH` | Major-version disagreement in HELLO/HELLO_ACK. | platform | **No** — restart required after upgrade. |
+| 4427 | `SESSION_TAKEN_OVER` | A same-`machine_id` shim connected and took over (this connection is the old one being evicted). | platform | **No** — the takeover is intentional. |
+| 4428 | `SESSION_REVOKED` | User revoked this session in the platform UI (or related admin action). | platform | **No** — auth gone, would just 401. |
+| 4429 | `PLATFORM_SHUTDOWN` | Platform is going down (graceful). | platform | **No** for *this* session — reconnect attempts SHOULD wait for platform health probe. Today the shim just halts; operator restart triggers a fresh connect. |
+
+Codes below 4426 follow IETF/RFC semantics (1000 normal, 1011 server
+error, etc.) and the shim DOES auto-reconnect with exponential backoff —
+only the application-layer codes in the table above are treated as fatal
+"do not retry without operator action".
+
+> The platform-side `ShimConnectionManager` change that actually emits
+> `SESSION_REVOKED` and close-code 4427 lives in a separate ticket; this
+> section is the contract the shim implements on the receive side.
+
+---
+
 ## Concurrency
 
 The platform may send multiple requests before receiving responses (pipelined). The shim

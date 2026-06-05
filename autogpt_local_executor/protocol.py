@@ -134,6 +134,8 @@ class MessageType(str, Enum):
     ERROR = "ERROR"
     PING = "PING"
     PONG = "PONG"
+    # Session ownership / lifecycle (see PROTOCOL.md → Session ownership).
+    SESSION_REVOKED = "SESSION_REVOKED"
 
 
 class ErrorCode(str, Enum):
@@ -515,6 +517,35 @@ class PingPongPayload(_Payload):
     pass
 
 
+# ── Session ownership ────────────────────────────────────────────────────────
+
+# Reason values for SESSION_REVOKED. Extending this enum is a forward-compatible
+# minor-version change — receivers tolerate unknown reasons and treat them as
+# the catch-all "revoked, do not auto-reconnect" case.
+SESSION_REVOKED_REASONS = (
+    "another_shim_connected",
+    "user_revoked",
+    "platform_shutdown",
+)
+
+
+class SessionRevokedPayload(_Payload):
+    """Platform → shim notification that this session is no longer valid.
+
+    On receipt the shim MUST:
+      1. Audit a SESSION_REVOKED record with the carried reason.
+      2. Send no further frames on this connection.
+      3. Gracefully close its half of the WebSocket.
+      4. NOT auto-reconnect to the same session_id.
+
+    `new_shim_machine_id` is set when reason is `another_shim_connected` and
+    the platform knows the takeover machine; it's purely informational.
+    """
+
+    reason: str
+    new_shim_machine_id: str | None = None
+
+
 # ── Envelopes ────────────────────────────────────────────────────────────────
 
 
@@ -710,9 +741,14 @@ class PongMessage(_Envelope):
     payload: PingPongPayload = Field(default_factory=PingPongPayload)
 
 
+class SessionRevokedMessage(_Envelope):
+    type: Literal[MessageType.SESSION_REVOKED] = MessageType.SESSION_REVOKED
+    payload: SessionRevokedPayload
+
+
 # Discriminated union — used when parsing inbound frames.
 Message = Annotated[
-    HelloMessage | HelloAckMessage | ExecuteCommandMessage | CommandResultMessage | FileReadMessage | FileContentsMessage | FileWriteMessage | AckMessage | FileStatMessage | FileStatResponseMessage | FileListMessage | FileListResponseMessage | FileDeleteMessage | FileMoveMessage | ScreenshotRequestMessage | ScreenshotResponseMessage | InputActionMessage | CursorPositionRequestMessage | CursorPositionResponseMessage | DisplayInfoRequestMessage | DisplayInfoResponseMessage | WindowListRequestMessage | WindowListResponseMessage | WindowFocusMessage | AppListRequestMessage | AppListResponseMessage | AppLaunchMessage | ClipboardReadMessage | ClipboardReadResponseMessage | ClipboardWriteMessage | PermissionsCheckRequestMessage | PermissionsCheckResponseMessage | ErrorMessage | PingMessage | PongMessage,
+    HelloMessage | HelloAckMessage | ExecuteCommandMessage | CommandResultMessage | FileReadMessage | FileContentsMessage | FileWriteMessage | AckMessage | FileStatMessage | FileStatResponseMessage | FileListMessage | FileListResponseMessage | FileDeleteMessage | FileMoveMessage | ScreenshotRequestMessage | ScreenshotResponseMessage | InputActionMessage | CursorPositionRequestMessage | CursorPositionResponseMessage | DisplayInfoRequestMessage | DisplayInfoResponseMessage | WindowListRequestMessage | WindowListResponseMessage | WindowFocusMessage | AppListRequestMessage | AppListResponseMessage | AppLaunchMessage | ClipboardReadMessage | ClipboardReadResponseMessage | ClipboardWriteMessage | PermissionsCheckRequestMessage | PermissionsCheckResponseMessage | ErrorMessage | PingMessage | PongMessage | SessionRevokedMessage,
     Field(discriminator="type"),
 ]
 
@@ -848,6 +884,9 @@ __all__ = [
     "ScreenshotResponseMessage",
     "ScreenshotResponseMeta",
     "ScreenshotResponsePayload",
+    "SESSION_REVOKED_REASONS",
+    "SessionRevokedMessage",
+    "SessionRevokedPayload",
     "Shell",
     "ValidationError",
     "WindowFocusMessage",

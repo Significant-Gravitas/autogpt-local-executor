@@ -41,6 +41,21 @@ class MessageType(str, Enum):
     SCREENSHOT_REQUEST = "SCREENSHOT_REQUEST"
     SCREENSHOT_RESPONSE = "SCREENSHOT_RESPONSE"
     INPUT_ACTION = "INPUT_ACTION"
+    CURSOR_POSITION_REQUEST = "CURSOR_POSITION_REQUEST"
+    CURSOR_POSITION_RESPONSE = "CURSOR_POSITION_RESPONSE"
+    DISPLAY_INFO_REQUEST = "DISPLAY_INFO_REQUEST"
+    DISPLAY_INFO_RESPONSE = "DISPLAY_INFO_RESPONSE"
+    WINDOW_LIST_REQUEST = "WINDOW_LIST_REQUEST"
+    WINDOW_LIST_RESPONSE = "WINDOW_LIST_RESPONSE"
+    WINDOW_FOCUS = "WINDOW_FOCUS"
+    APP_LIST_REQUEST = "APP_LIST_REQUEST"
+    APP_LIST_RESPONSE = "APP_LIST_RESPONSE"
+    APP_LAUNCH = "APP_LAUNCH"
+    CLIPBOARD_READ = "CLIPBOARD_READ"
+    CLIPBOARD_READ_RESPONSE = "CLIPBOARD_READ_RESPONSE"
+    CLIPBOARD_WRITE = "CLIPBOARD_WRITE"
+    PERMISSIONS_CHECK_REQUEST = "PERMISSIONS_CHECK_REQUEST"
+    PERMISSIONS_CHECK_RESPONSE = "PERMISSIONS_CHECK_RESPONSE"
     ACK = "ACK"
     ERROR = "ERROR"
     PING = "PING"
@@ -63,6 +78,12 @@ class ErrorCode(str, Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
     DEPENDENCY_MISSING = "DEPENDENCY_MISSING"
+    # Computer-use additions (see docs/COMPUTER_USE.md Q1-Q5).
+    WINDOW_STALE = "WINDOW_STALE"
+    PERMISSION_PENDING = "PERMISSION_PENDING"
+    FEATURE_NOT_SUPPORTED = "FEATURE_NOT_SUPPORTED"
+    CLIPBOARD_CONCEALED = "CLIPBOARD_CONCEALED"
+    INPUT_OUT_OF_BOUNDS = "INPUT_OUT_OF_BOUNDS"
 
 
 class Platform(str, Enum):
@@ -116,6 +137,9 @@ class HelloPayload(_Payload):
     allowed_root: str
     local_llm_models: list[str] = Field(default_factory=list)
     hardware_devices: list[dict[str, Any]] = Field(default_factory=list)
+    # Computer-use feature advertisement, per COMPUTER_USE.md.
+    computer_use_features: list[str] = Field(default_factory=list)
+    computer_use_features_coarse: list[str] = Field(default_factory=list)
 
 
 class HelloAckPayload(_Payload):
@@ -229,6 +253,19 @@ class FileMovePayload(_Payload):
 class ScreenshotRequestPayload(_Payload):
     monitor: int = 0
     quality: int = 75
+    region: tuple[int, int, int, int] | None = None
+    window_id: str | None = None
+    format: Literal["jpeg", "png"] = "jpeg"
+    include_cursor: bool = True
+
+
+class ScreenshotResponseMeta(BaseModel):
+    """Echo block for region/window crops, per COMPUTER_USE.md Q1."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    origin: tuple[int, int] = (0, 0)
+    display_id: int = 0
 
 
 class ScreenshotResponsePayload(_Payload):
@@ -237,6 +274,10 @@ class ScreenshotResponsePayload(_Payload):
     width: int
     height: int
     monitor: int = 0
+    region: tuple[int, int, int, int] | None = None
+    display_scale: float = 1.0
+    logical_size: tuple[int, int] | None = None
+    meta: ScreenshotResponseMeta = Field(default_factory=ScreenshotResponseMeta)
 
 
 class InputActionPayload(_Payload):
@@ -244,22 +285,150 @@ class InputActionPayload(_Payload):
         "left_click",
         "right_click",
         "double_click",
+        "middle_click",
+        "triple_click",
         "mouse_move",
+        "mouse_down",
+        "mouse_up",
+        "drag",
         "type",
         "key",
+        "hold_key",
         "scroll",
+        "wait",
     ]
     coordinate: tuple[int, int] | None = None
     text: str | None = None
     key: str | None = None
     direction: Literal["up", "down"] | None = None
     clicks: int | None = None
+    # v1 additions, per COMPUTER_USE.md.
+    button: Literal["left", "middle", "right"] | None = None
+    modifiers: list[Literal["shift", "ctrl", "alt", "super"]] | None = None
+    scroll_amount: int | None = None
+    scroll_direction: Literal["up", "down", "left", "right"] | None = None
+    duration_ms: int | None = None
+    path: list[tuple[int, int]] | None = None
+    paste: bool = False
+    preserve_clipboard: bool = False
+
+
+class CursorPositionRequestPayload(_Payload):
+    pass
+
+
+class CursorPositionResponsePayload(_Payload):
+    x: int
+    y: int
+    monitor: int = 0
+
+
+class DisplayInfoRequestPayload(_Payload):
+    pass
+
+
+class DisplayMonitor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    primary: bool = False
+    physical_size: tuple[int, int]
+    logical_size: tuple[int, int]
+    scale: float = 1.0
+    origin: tuple[int, int] = (0, 0)
+
+
+class DisplayInfoResponsePayload(_Payload):
+    monitors: list[DisplayMonitor]
+
+
+class WindowListRequestPayload(_Payload):
+    app_bundle_id: str | None = None
+    include_minimized: bool = False
+    include_offscreen: bool = False
+
+
+class WindowInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_id: str
+    pid: int
+    app_name: str | None = None
+    app_bundle_id: str | None = None
+    title: str | None = None
+    bounds: tuple[int, int, int, int]  # [x1, y1, x2, y2]
+    monitor: int = 0
+    is_focused: bool = False
+    is_minimized: bool = False
+    is_fullscreen: bool = False
+
+
+class WindowListResponsePayload(_Payload):
+    windows: list[WindowInfo]
+    truncated: bool = False
+
+
+class WindowFocusPayload(_Payload):
+    window_id: str
+    raise_: bool = Field(default=True, alias="raise")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class AppListRequestPayload(_Payload):
+    include_background: bool = False
+
+
+class AppInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pid: int
+    name: str
+    bundle_id: str | None = None
+    executable_path: str | None = None
+    is_frontmost: bool = False
+    window_count: int = 0
+
+
+class AppListResponsePayload(_Payload):
+    apps: list[AppInfo]
+
+
+class AppLaunchPayload(_Payload):
+    bundle_id: str | None = None
+    executable_path: str | None = None
+    args: list[str] = Field(default_factory=list)
+    activate: bool = True
+
+
+class ClipboardReadPayload(_Payload):
+    format: Literal["text", "image"] = "text"
+
+
+class ClipboardReadResponsePayload(_Payload):
+    format: Literal["text", "image"] = "text"
+    content: str
+    size_bytes: int
+
+
+class ClipboardWritePayload(_Payload):
+    format: Literal["text", "image"] = "text"
+    content: str
+
+
+class PermissionsCheckRequestPayload(_Payload):
+    permissions: list[str]
+
+
+class PermissionsCheckResponsePayload(_Payload):
+    permissions: dict[str, Literal["granted", "denied", "unknown", "not_applicable"]]
 
 
 class ErrorPayload(_Payload):
     code: ErrorCode | str
     message: str
     fatal: bool = False
+    details: dict[str, Any] | None = None
 
 
 class PingPongPayload(_Payload):
@@ -363,6 +532,81 @@ class InputActionMessage(_Envelope):
     payload: InputActionPayload
 
 
+class CursorPositionRequestMessage(_Envelope):
+    type: Literal[MessageType.CURSOR_POSITION_REQUEST] = MessageType.CURSOR_POSITION_REQUEST
+    payload: CursorPositionRequestPayload = Field(default_factory=CursorPositionRequestPayload)
+
+
+class CursorPositionResponseMessage(_Envelope):
+    type: Literal[MessageType.CURSOR_POSITION_RESPONSE] = MessageType.CURSOR_POSITION_RESPONSE
+    payload: CursorPositionResponsePayload
+
+
+class DisplayInfoRequestMessage(_Envelope):
+    type: Literal[MessageType.DISPLAY_INFO_REQUEST] = MessageType.DISPLAY_INFO_REQUEST
+    payload: DisplayInfoRequestPayload = Field(default_factory=DisplayInfoRequestPayload)
+
+
+class DisplayInfoResponseMessage(_Envelope):
+    type: Literal[MessageType.DISPLAY_INFO_RESPONSE] = MessageType.DISPLAY_INFO_RESPONSE
+    payload: DisplayInfoResponsePayload
+
+
+class WindowListRequestMessage(_Envelope):
+    type: Literal[MessageType.WINDOW_LIST_REQUEST] = MessageType.WINDOW_LIST_REQUEST
+    payload: WindowListRequestPayload = Field(default_factory=WindowListRequestPayload)
+
+
+class WindowListResponseMessage(_Envelope):
+    type: Literal[MessageType.WINDOW_LIST_RESPONSE] = MessageType.WINDOW_LIST_RESPONSE
+    payload: WindowListResponsePayload
+
+
+class WindowFocusMessage(_Envelope):
+    type: Literal[MessageType.WINDOW_FOCUS] = MessageType.WINDOW_FOCUS
+    payload: WindowFocusPayload
+
+
+class AppListRequestMessage(_Envelope):
+    type: Literal[MessageType.APP_LIST_REQUEST] = MessageType.APP_LIST_REQUEST
+    payload: AppListRequestPayload = Field(default_factory=AppListRequestPayload)
+
+
+class AppListResponseMessage(_Envelope):
+    type: Literal[MessageType.APP_LIST_RESPONSE] = MessageType.APP_LIST_RESPONSE
+    payload: AppListResponsePayload
+
+
+class AppLaunchMessage(_Envelope):
+    type: Literal[MessageType.APP_LAUNCH] = MessageType.APP_LAUNCH
+    payload: AppLaunchPayload
+
+
+class ClipboardReadMessage(_Envelope):
+    type: Literal[MessageType.CLIPBOARD_READ] = MessageType.CLIPBOARD_READ
+    payload: ClipboardReadPayload = Field(default_factory=ClipboardReadPayload)
+
+
+class ClipboardReadResponseMessage(_Envelope):
+    type: Literal[MessageType.CLIPBOARD_READ_RESPONSE] = MessageType.CLIPBOARD_READ_RESPONSE
+    payload: ClipboardReadResponsePayload
+
+
+class ClipboardWriteMessage(_Envelope):
+    type: Literal[MessageType.CLIPBOARD_WRITE] = MessageType.CLIPBOARD_WRITE
+    payload: ClipboardWritePayload
+
+
+class PermissionsCheckRequestMessage(_Envelope):
+    type: Literal[MessageType.PERMISSIONS_CHECK_REQUEST] = MessageType.PERMISSIONS_CHECK_REQUEST
+    payload: PermissionsCheckRequestPayload
+
+
+class PermissionsCheckResponseMessage(_Envelope):
+    type: Literal[MessageType.PERMISSIONS_CHECK_RESPONSE] = MessageType.PERMISSIONS_CHECK_RESPONSE
+    payload: PermissionsCheckResponsePayload
+
+
 class ErrorMessage(_Envelope):
     type: Literal[MessageType.ERROR] = MessageType.ERROR
     payload: ErrorPayload
@@ -398,6 +642,21 @@ Message = Annotated[
         ScreenshotRequestMessage,
         ScreenshotResponseMessage,
         InputActionMessage,
+        CursorPositionRequestMessage,
+        CursorPositionResponseMessage,
+        DisplayInfoRequestMessage,
+        DisplayInfoResponseMessage,
+        WindowListRequestMessage,
+        WindowListResponseMessage,
+        WindowFocusMessage,
+        AppListRequestMessage,
+        AppListResponseMessage,
+        AppLaunchMessage,
+        ClipboardReadMessage,
+        ClipboardReadResponseMessage,
+        ClipboardWriteMessage,
+        PermissionsCheckRequestMessage,
+        PermissionsCheckResponseMessage,
         ErrorMessage,
         PingMessage,
         PongMessage,
@@ -442,11 +701,12 @@ def make_error(
     code: ErrorCode | str,
     message: str,
     fatal: bool = False,
+    details: dict[str, Any] | None = None,
 ) -> ErrorMessage:
     return ErrorMessage(
         id=msg_id,
         ts=now_ts(),
-        payload=ErrorPayload(code=code, message=message, fatal=fatal),
+        payload=ErrorPayload(code=code, message=message, fatal=fatal, details=details),
     )
 
 
@@ -462,8 +722,30 @@ __all__ = [
     "Arch",
     "AckMessage",
     "AckPayload",
+    "AppInfo",
+    "AppLaunchMessage",
+    "AppLaunchPayload",
+    "AppListRequestMessage",
+    "AppListRequestPayload",
+    "AppListResponseMessage",
+    "AppListResponsePayload",
+    "ClipboardReadMessage",
+    "ClipboardReadPayload",
+    "ClipboardReadResponseMessage",
+    "ClipboardReadResponsePayload",
+    "ClipboardWriteMessage",
+    "ClipboardWritePayload",
     "CommandResultMessage",
     "CommandResultPayload",
+    "CursorPositionRequestMessage",
+    "CursorPositionRequestPayload",
+    "CursorPositionResponseMessage",
+    "CursorPositionResponsePayload",
+    "DisplayInfoRequestMessage",
+    "DisplayInfoRequestPayload",
+    "DisplayInfoResponseMessage",
+    "DisplayInfoResponsePayload",
+    "DisplayMonitor",
     "Encoding",
     "ErrorCode",
     "ErrorMessage",
@@ -498,6 +780,10 @@ __all__ = [
     "InputActionPayload",
     "Message",
     "MessageType",
+    "PermissionsCheckRequestMessage",
+    "PermissionsCheckRequestPayload",
+    "PermissionsCheckResponseMessage",
+    "PermissionsCheckResponsePayload",
     "PingMessage",
     "PingPongPayload",
     "Platform",
@@ -505,9 +791,17 @@ __all__ = [
     "ScreenshotRequestMessage",
     "ScreenshotRequestPayload",
     "ScreenshotResponseMessage",
+    "ScreenshotResponseMeta",
     "ScreenshotResponsePayload",
     "Shell",
     "ValidationError",
+    "WindowFocusMessage",
+    "WindowFocusPayload",
+    "WindowInfo",
+    "WindowListRequestMessage",
+    "WindowListRequestPayload",
+    "WindowListResponseMessage",
+    "WindowListResponsePayload",
     "dump_message",
     "make_ack",
     "make_error",

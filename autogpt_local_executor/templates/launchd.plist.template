@@ -21,8 +21,19 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!--
+      KeepAlive: SuccessfulExit=false re-launches the daemon on any
+      non-zero exit. The Q5 TCC chain relies on this: when computer-use
+      is requested but Accessibility / Screen Recording aren't granted,
+      the daemon exits 78 (EX_CONFIG); a TCC.db change (user granting
+      consent in System Settings) lets the next launch succeed.
+      See docs/COMPUTER_USE.md Q5 and docs/CROSS_PLATFORM.md "Autostart".
+    -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>ProcessType</key>
     <string>Background</string>

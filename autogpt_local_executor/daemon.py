@@ -14,6 +14,7 @@ can't starve keepalive.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 from typing import Any
@@ -27,6 +28,7 @@ from .auth import KeychainTokenStore
 from .config import ShimConfig
 from .handlers import CommandHandler, ComputerUseHandler, FileHandler
 from .protocol import (
+    VERSION as PROTOCOL_VERSION,
     AppLaunchMessage,
     AppListRequestMessage,
     ClipboardReadMessage,
@@ -47,16 +49,22 @@ from .protocol import (
     InputActionMessage,
     PermissionsCheckRequestMessage,
     PingMessage,
+    ProtocolVersionMismatch,
     ScreenshotRequestMessage,
     WindowFocusMessage,
     WindowListRequestMessage,
     dump_message,
     make_error,
     make_pong,
+    negotiate_version,
     new_id,
     now_ts,
     parse_message,
 )
+
+# WebSocket close codes the platform may use to signal structured failures.
+# Mirrors docs/PROTOCOL.md → Close codes. Application-range (4000-4999).
+WS_CLOSE_PROTOCOL_VERSION_MISMATCH = 4426
 
 
 class DaemonPreflightError(RuntimeError):
@@ -93,6 +101,13 @@ class ShimDaemon:
         self._ws: Any = None
         self._semaphore: asyncio.Semaphore | None = None
         self._shim_start_logged = False
+        # Effective negotiated protocol version, populated on HELLO_ACK.
+        # `None` before handshake completes.
+        self._negotiated_version: str | None = None
+        # Set true when a session terminates fatally and the shim MUST NOT
+        # auto-reconnect (protocol version mismatch, session revoked, etc.).
+        # The reconnect loop checks this and exits cleanly.
+        self._disable_reconnect: bool = False
 
     @staticmethod
     def _build_audit_writer(config: ShimConfig) -> AuditWriter | None:
@@ -135,8 +150,23 @@ class ShimDaemon:
                     attempt = 0
                 except asyncio.CancelledError:
                     raise
+                except ProtocolVersionMismatch as exc:
+                    # Refuse to retry: a hot-reconnect loop against an
+                    # incompatible platform just spams logs and burns rate
+                    # limits. Operator must restart the shim after upgrading
+                    # one side.
+                    logger.error(
+                        "Protocol version mismatch (shim=%s platform=%s). "
+                        "Will not auto-reconnect; restart the shim after "
+                        "upgrading. Hint: %s",
+                        exc.shim_max,
+                        exc.platform_max,
+                        exc.hint,
+                    )
+                    self._disable_reconnect = True
+                    break
                 except Exception as exc:
-                    if not self._running:
+                    if not self._running or self._disable_reconnect:
                         break
                     delay = self._backoff_delay(attempt)
                     logger.warning(
@@ -289,6 +319,24 @@ class ShimDaemon:
             )
         # Honor the server's negotiated limits.
         payload = ack.payload
+        # Negotiate wire-protocol version BEFORE applying any other limits.
+        # If majors disagree we tear the WS down with 4426 and surface
+        # ProtocolVersionMismatch so the run() loop disables reconnect.
+        try:
+            self._negotiated_version = negotiate_version(
+                shim_max=PROTOCOL_VERSION,
+                platform_max=payload.protocol_version,
+            )
+        except ProtocolVersionMismatch as exc:
+            close_reason = json.dumps(exc.to_close_reason())
+            try:
+                await ws.close(
+                    code=WS_CLOSE_PROTOCOL_VERSION_MISMATCH,
+                    reason=close_reason,
+                )
+            except Exception:
+                logger.debug("ws.close after version mismatch failed", exc_info=True)
+            raise
         self.config.max_concurrent = payload.max_concurrent
         self.config.command_timeout_seconds = payload.command_timeout_seconds
         self.config.max_file_size_bytes = payload.max_file_size_bytes
@@ -302,11 +350,13 @@ class ShimDaemon:
             except Exception:
                 logger.debug("CONFIG_RELOADED audit emit failed", exc_info=True)
         logger.info(
-            "Connected. session=%s granted_capabilities=%s max_concurrent=%d timeout=%ds",
+            "Connected. session=%s granted_capabilities=%s max_concurrent=%d "
+            "timeout=%ds protocol=%s",
             payload.session_id,
             payload.granted_capabilities,
             payload.max_concurrent,
             payload.command_timeout_seconds,
+            self._negotiated_version,
         )
         return ack
 
@@ -339,6 +389,7 @@ class ShimDaemon:
             hardware_devices=[],
             computer_use_features=cu_features,
             computer_use_features_coarse=cu_features_coarse,
+            protocol_version=PROTOCOL_VERSION,
         )
         return HelloMessage(id=new_id(), ts=now_ts(), payload=payload)
 

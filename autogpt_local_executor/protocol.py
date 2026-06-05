@@ -20,6 +20,81 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
+# ── Protocol version ─────────────────────────────────────────────────────────
+
+# Wire protocol version this shim speaks. Format: "<major>.<minor>" string.
+# Negotiation rules (see docs/PROTOCOL.md → Versioning):
+#   * Major MUST match between shim and platform. Mismatch → connection
+#     closed with WS code 4426 and reason PROTOCOL_VERSION_MISMATCH; shim
+#     MUST NOT auto-reconnect.
+#   * Minor floor wins: effective negotiated minor is min(shim, platform).
+#     Both sides MUST tolerate forward-compatible additions within a major.
+#   * Every envelope SHOULD carry `version` matching the negotiated value,
+#     but receivers MUST be lenient — HELLO-time negotiation is the truth.
+VERSION: str = "1.0"
+
+
+def _split_version(v: str) -> tuple[int, int]:
+    """Parse a "major.minor" string. Raises ValueError on malformed input.
+
+    Pre-release/build suffixes are not part of the wire format — we only
+    need major.minor for compat negotiation.
+    """
+    parts = v.split(".")
+    if len(parts) != 2:
+        raise ValueError(f"protocol version must be 'major.minor', got {v!r}")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"protocol version components must be integers, got {v!r}") from exc
+
+
+def negotiate_version(shim_max: str, platform_max: str) -> str:
+    """Compute the effective negotiated protocol version.
+
+    Returns a "major.minor" string. Raises ProtocolVersionMismatch when the
+    majors don't match — caller is responsible for tearing down the WS with
+    code 4426 and surfacing the structured close reason.
+    """
+    shim_major, shim_minor = _split_version(shim_max)
+    plat_major, plat_minor = _split_version(platform_max)
+    if shim_major != plat_major:
+        raise ProtocolVersionMismatch(
+            shim_max=shim_max,
+            platform_max=platform_max,
+            hint=(
+                "Major version mismatch — update the side running the older "
+                "major. Shims and platforms within a major are "
+                "forward-compatible on minor."
+            ),
+        )
+    return f"{shim_major}.{min(shim_minor, plat_minor)}"
+
+
+class ProtocolVersionMismatch(Exception):
+    """Raised when shim_max and platform_max have different majors.
+
+    Carries the structured fields that go into the WS close reason and
+    the SESSION_REVOKED-style audit record.
+    """
+
+    def __init__(self, *, shim_max: str, platform_max: str, hint: str) -> None:
+        self.shim_max = shim_max
+        self.platform_max = platform_max
+        self.hint = hint
+        super().__init__(
+            f"protocol version mismatch: shim_max={shim_max} platform_max={platform_max}"
+        )
+
+    def to_close_reason(self) -> dict[str, str]:
+        return {
+            "error": "PROTOCOL_VERSION_MISMATCH",
+            "shim_max": self.shim_max,
+            "platform_max": self.platform_max,
+            "hint": self.hint,
+        }
+
+
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
@@ -139,6 +214,9 @@ class HelloPayload(_Payload):
     # Computer-use feature advertisement, per COMPUTER_USE.md.
     computer_use_features: list[str] = Field(default_factory=list)
     computer_use_features_coarse: list[str] = Field(default_factory=list)
+    # Highest wire-protocol version this shim supports. "major.minor".
+    # Receiving side negotiates the effective version (see VERSION docs).
+    protocol_version: str = VERSION
 
 
 class HelloAckPayload(_Payload):
@@ -147,6 +225,9 @@ class HelloAckPayload(_Payload):
     max_file_size_bytes: int = 10 * 1024 * 1024
     command_timeout_seconds: int = 30
     max_concurrent: int = 4
+    # Highest wire-protocol version this platform supports. "major.minor".
+    # Effective negotiated version = same major, min(shim_minor, plat_minor).
+    protocol_version: str = VERSION
 
 
 class ExecuteCommandPayload(_Payload):
@@ -438,12 +519,20 @@ class PingPongPayload(_Payload):
 
 
 class _Envelope(BaseModel):
-    """Per-type envelope. Subclasses fix `type` and `payload`."""
+    """Per-type envelope. Subclasses fix `type` and `payload`.
+
+    The `version` field carries the wire-protocol version this sender speaks
+    (or, post-HELLO_ACK, the negotiated version). Receivers MUST be lenient:
+    if it's missing or differs in minor from the negotiation, treat the
+    HELLO-time negotiation as truth. A differing major on a non-HELLO frame
+    is a hard error (drop the frame, log loudly).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str
     ts: float
+    version: str = VERSION
 
 
 class HelloMessage(_Envelope):
@@ -682,6 +771,9 @@ def make_pong(msg_id: str) -> PongMessage:
 
 
 __all__ = [
+    "VERSION",
+    "ProtocolVersionMismatch",
+    "negotiate_version",
     "Arch",
     "AckMessage",
     "AckPayload",

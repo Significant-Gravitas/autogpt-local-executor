@@ -18,11 +18,52 @@ All messages are JSON with this envelope:
   "type": "MESSAGE_TYPE",
   "id": "uuid-v4",
   "ts": 1712345678.123,
+  "version": "1.0",
   "payload": { ... }
 }
 ```
 
 `id` is used for request/response correlation. Every request gets a response with the same `id`.
+
+`version` is the wire-protocol version this sender speaks, formatted
+`"major.minor"`. Always emitted by both sides. Receivers MUST be lenient
+on non-HELLO frames — use the negotiated version (see
+[Versioning](#versioning)) as the source of truth.
+
+---
+
+## Versioning
+
+The wire protocol carries a `version` field on every envelope, and HELLO /
+HELLO_ACK each carry a `protocol_version` field in the payload that
+advertises the **maximum** version that side supports.
+
+### Negotiation
+
+On connect, the shim sends `HELLO.payload.protocol_version` (its max). The
+platform replies with `HELLO_ACK.payload.protocol_version` (its max). Both
+sides compute the **effective negotiated version** as:
+
+| Case | Result |
+|---|---|
+| Same major, same minor | That version. |
+| Same major, different minor | Same major, `min(shim_minor, platform_minor)`. Both sides MUST tolerate forward-compatible additions within a major. |
+| Different majors | **Hard error.** Platform closes the WebSocket with close code **4426** and reason `{"error": "PROTOCOL_VERSION_MISMATCH", "shim_max": "...", "platform_max": "...", "hint": "..."}` (JSON-encoded). The shim MUST log the mismatch and MUST NOT auto-reconnect until restarted — this avoids hot-reconnect storms against an incompatible peer. |
+
+### Frame-level `version`
+
+All non-HELLO frames SHOULD set `version` to the negotiated value, but
+receivers MUST treat the HELLO-time negotiation as truth. A receiver that
+sees a non-HELLO frame with a different *minor* MUST process it normally;
+a frame with a different *major* MUST be dropped and logged loudly (and
+on the platform side, the session SHOULD be torn down with code 4426).
+
+### Current versions
+
+| Side | Maximum | Notes |
+|---|---|---|
+| Shim | `1.0` | `autogpt_local_executor.protocol.VERSION` |
+| Platform | `1.0` | Mirror this constant in the platform repo. |
 
 ---
 
@@ -36,8 +77,10 @@ All messages are JSON with this envelope:
   "type": "HELLO",
   "id": "uuid",
   "ts": 1234567890.0,
+  "version": "1.0",
   "payload": {
     "shim_version": "0.1.0",
+    "protocol_version": "1.0",     // max wire version this shim supports
     "machine_id": "hostname-uuid4",
     "platform": "darwin",          // "darwin" | "linux" | "windows" | "wsl2"
     "arch": "arm64",               // "x86_64" | "arm64" (normalized; see below)
@@ -67,8 +110,10 @@ All messages are JSON with this envelope:
   "type": "HELLO_ACK",
   "id": "same-uuid-as-HELLO",
   "ts": 1234567890.1,
+  "version": "1.0",
   "payload": {
     "session_id": "session-uuid",
+    "protocol_version": "1.0",     // max wire version this platform supports
     "granted_capabilities": ["shell", "files"],  // subset platform approved
     "max_file_size_bytes": 10485760,
     "command_timeout_seconds": 30,
@@ -76,6 +121,10 @@ All messages are JSON with this envelope:
   }
 }
 ```
+
+The effective negotiated wire-protocol version is computed per
+[Versioning](#versioning). Mismatched majors close the WebSocket with code
+4426 and the shim disables auto-reconnect.
 
 `max_concurrent` sizes the shim-side request semaphore. The shim must
 refuse (with `SHIM_OVERLOADED`) any request that arrives while the

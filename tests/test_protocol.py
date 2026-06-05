@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from autogpt_local_executor.protocol import (
+    VERSION,
     ErrorCode,
     ExecuteCommandMessage,
     FileReadMessage,
@@ -16,11 +17,13 @@ from autogpt_local_executor.protocol import (
     HelloPayload,
     MessageType,
     Platform,
+    ProtocolVersionMismatch,
     Shell,
     dump_message,
     make_ack,
     make_error,
     make_pong,
+    negotiate_version,
     new_id,
     parse_message,
 )
@@ -167,3 +170,130 @@ def test_shell_enum_accepts_auto() -> None:
     msg = parse_message(raw)
     assert isinstance(msg, ExecuteCommandMessage)
     assert msg.payload.shell == Shell.AUTO
+
+
+# ── Wire-protocol version (#35) ──────────────────────────────────────────────
+
+
+def test_envelope_emits_version_field_by_default() -> None:
+    """Every envelope serializes with the current VERSION."""
+    ack = make_ack("x")
+    payload = json.loads(dump_message(ack))
+    assert payload["version"] == VERSION
+
+
+def test_hello_payload_includes_protocol_version() -> None:
+    """HELLO's payload carries the shim's max-supported protocol version."""
+    msg = HelloMessage(
+        id=new_id(),
+        ts=1.0,
+        payload=HelloPayload(
+            shim_version="0.0.1",
+            machine_id="m1",
+            platform=Platform.LINUX,
+            arch="x86_64",  # type: ignore[arg-type]
+            capabilities=["shell", "files"],
+            allowed_root="/home/u/ws",
+        ),
+    )
+    payload = json.loads(dump_message(msg))
+    assert payload["payload"]["protocol_version"] == VERSION
+
+
+def test_parse_envelope_tolerates_missing_version() -> None:
+    """Receivers must be lenient: an inbound frame without `version` still parses."""
+    raw = json.dumps({"type": "PING", "id": "abc", "ts": 1.0, "payload": {}})
+    msg = parse_message(raw)
+    # The default kicks in.
+    assert msg.version == VERSION
+
+
+def test_parse_envelope_accepts_explicit_version() -> None:
+    raw = json.dumps(
+        {"type": "PING", "id": "abc", "ts": 1.0, "version": "1.4", "payload": {}}
+    )
+    msg = parse_message(raw)
+    assert msg.version == "1.4"
+
+
+def test_negotiate_version_same_version() -> None:
+    assert negotiate_version("1.0", "1.0") == "1.0"
+
+
+def test_negotiate_version_minor_floor_shim_lower() -> None:
+    assert negotiate_version("1.2", "1.7") == "1.2"
+
+
+def test_negotiate_version_minor_floor_platform_lower() -> None:
+    assert negotiate_version("1.7", "1.2") == "1.2"
+
+
+def test_negotiate_version_major_mismatch_shim_older() -> None:
+    with pytest.raises(ProtocolVersionMismatch) as exc_info:
+        negotiate_version("1.5", "2.0")
+    err = exc_info.value
+    assert err.shim_max == "1.5"
+    assert err.platform_max == "2.0"
+    reason = err.to_close_reason()
+    assert reason["error"] == "PROTOCOL_VERSION_MISMATCH"
+    assert reason["shim_max"] == "1.5"
+    assert reason["platform_max"] == "2.0"
+    assert "hint" in reason
+
+
+def test_negotiate_version_major_mismatch_platform_older() -> None:
+    with pytest.raises(ProtocolVersionMismatch):
+        negotiate_version("2.0", "1.5")
+
+
+def test_negotiate_version_malformed_input() -> None:
+    with pytest.raises(ValueError):
+        negotiate_version("1", "1.0")
+    with pytest.raises(ValueError):
+        negotiate_version("v1.0", "1.0")
+    with pytest.raises(ValueError):
+        negotiate_version("1.0.1", "1.0")
+
+
+def test_parse_hello_ack_with_protocol_version() -> None:
+    raw = json.dumps(
+        {
+            "type": "HELLO_ACK",
+            "id": "abc",
+            "ts": 1.0,
+            "version": "1.0",
+            "payload": {
+                "session_id": "s1",
+                "granted_capabilities": ["shell"],
+                "max_file_size_bytes": 1024,
+                "command_timeout_seconds": 5,
+                "max_concurrent": 2,
+                "protocol_version": "1.0",
+            },
+        }
+    )
+    msg = parse_message(raw)
+    assert isinstance(msg, HelloAckMessage)
+    assert msg.payload.protocol_version == "1.0"
+
+
+def test_parse_hello_ack_defaults_protocol_version() -> None:
+    """Receivers stay lenient: a HELLO_ACK without protocol_version still parses
+    and defaults to the current VERSION."""
+    raw = json.dumps(
+        {
+            "type": "HELLO_ACK",
+            "id": "abc",
+            "ts": 1.0,
+            "payload": {
+                "session_id": "s1",
+                "granted_capabilities": ["shell"],
+                "max_file_size_bytes": 1024,
+                "command_timeout_seconds": 5,
+                "max_concurrent": 2,
+            },
+        }
+    )
+    msg = parse_message(raw)
+    assert isinstance(msg, HelloAckMessage)
+    assert msg.payload.protocol_version == VERSION

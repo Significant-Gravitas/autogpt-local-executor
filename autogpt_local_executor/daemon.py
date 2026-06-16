@@ -63,9 +63,9 @@ from .protocol import (
     ScreenshotRequestMessage,
     SessionRevokedMessage,
     StartRecordingMessage,
-    StopRecordingMessage,
     StatusMessage,
     StatusPayload,
+    StopRecordingMessage,
     WindowFocusMessage,
     WindowListRequestMessage,
     dump_message,
@@ -790,9 +790,7 @@ class ShimDaemon:
             return await self._computer_handler.handle(msg)
         if isinstance(msg, LocalLLMCompletionMessage):
             return await self._local_llm_handler.handle(msg, send=send)
-        if isinstance(
-            msg, (StartRecordingMessage, StopRecordingMessage, RecordingFetchMessage)
-        ):
+        if isinstance(msg, (StartRecordingMessage, StopRecordingMessage, RecordingFetchMessage)):
             # START/STOP/FETCH are request/response ops that count against
             # in-flight (§6). The `send` callback lets START stream unsolicited
             # RECORDING_STEP frames in co-pilot mode (exempt from accounting,

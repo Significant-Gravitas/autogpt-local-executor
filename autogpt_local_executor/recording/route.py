@@ -43,13 +43,14 @@ class RouteDecision:
     reason: str
 
 
-def _structured_channels_present(channels: Iterable[RecordingChannel]) -> bool:
+def _structured_channels_present(channels: Iterable[str]) -> bool:
     """Probe 1: a11y/DOM channels are requested → structured text is free.
 
     We treat the *requested* channels as the signal here: if the platform asked
     for browser or desktop_ax enrichment, those channels resolve structured
     text per step and extract_then_cloud is lossless/cheap. The floor alone is
-    pixels-only and doesn't satisfy this probe.
+    pixels-only and doesn't satisfy this probe. Accepts plain strings so the
+    HELLO-time route advertisement (config channels are str) can reuse it.
     """
     chans = set(channels)
     return bool(chans & {"browser", "desktop_ax"})

@@ -833,7 +833,9 @@ class StartRecordingPayload(_Payload):
 
     mode: RecordingMode
     interpretation_route: InterpretationRoute = "extract_then_cloud"
-    channels: list[RecordingChannel] = Field(default_factory=lambda: ["floor"])
+    channels: list[RecordingChannel] = Field(
+        default_factory=lambda: ["floor"]  # type: ignore[arg-type]
+    )
     consent_token: str
 
 

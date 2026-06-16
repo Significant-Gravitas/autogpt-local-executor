@@ -88,8 +88,11 @@ class ConsentBroker:
             "exp": time.time() + ttl_seconds,
         }
         payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        sig = hmac.new(self._key, payload, sha256).digest()
-        token = base64.urlsafe_b64encode(payload + b"." + sig).decode("ascii")
+        sig = hmac.new(self._key, payload, sha256).digest()  # always 32 bytes
+        # Append the fixed-length 32-byte HMAC and base64 the whole thing. We
+        # do NOT use a delimiter: the digest is random bytes and could contain
+        # any separator we picked, so we split by the known sig length instead.
+        token = base64.urlsafe_b64encode(payload + sig).decode("ascii")
         logger.debug("Issued consent token jti=%s mode=%s", body["jti"], mode)
         return token
 
@@ -116,9 +119,13 @@ class ConsentBroker:
             raise ConsentError("no consent token supplied")
         try:
             blob = base64.urlsafe_b64decode(token.encode("ascii"))
-            payload, sig = blob.rsplit(b".", 1)
         except (ValueError, TypeError) as exc:
             raise ConsentError(f"malformed consent token: {exc}") from exc
+        # The trailing 32 bytes are the HMAC-SHA256 digest; everything before is
+        # the JSON payload. A blob shorter than the digest can't be ours.
+        if len(blob) <= sha256().digest_size:
+            raise ConsentError("malformed consent token: too short")
+        payload, sig = blob[: -sha256().digest_size], blob[-sha256().digest_size :]
 
         expected = hmac.new(self._key, payload, sha256).digest()
         if not hmac.compare_digest(expected, sig):

@@ -176,9 +176,7 @@ class RecordingSession:
         if self._stopped_at is not None:
             return
         self._stopped_at = time.time()
-        logger.debug(
-            "RecordingSession %s stopped (%d steps)", self.recording_id, len(self._steps)
-        )
+        logger.debug("RecordingSession %s stopped (%d steps)", self.recording_id, len(self._steps))
 
     def close(self, *, pin: bool = False) -> None:
         """Secure-erase the on-disk buffer unless pinned (§9 at-rest).

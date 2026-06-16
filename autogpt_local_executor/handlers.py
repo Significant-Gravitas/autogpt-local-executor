@@ -2024,9 +2024,23 @@ class RecordingHandler:
                 f"No active recording with id {msg.payload.recording_id!r}.",
             )
 
-        # Let the capture loop finish draining, then finalize.
+        # Stop capture and finalize. Steps are buffered synchronously by
+        # `append` as they're captured, so by STOP time everything the source
+        # has produced is already in the session. A finite source (a
+        # fully-played demonstration, or the test MockCaptureSource) may not
+        # have had a turn yet, so we yield once to let it run to completion;
+        # then we cancel whatever is still running (an infinite real OS
+        # input-hook source) to halt further capture.
         if self._consume_task is not None:
-            self._consume_task.cancel()
+            # Yield up to a bounded number of turns to let a finite source drain
+            # fully; stop early as soon as it completes. Bounded so an infinite
+            # real source falls through to cancellation rather than spinning.
+            for _ in range(64):
+                if self._consume_task.done():
+                    break
+                await asyncio.sleep(0)
+            if not self._consume_task.done():
+                self._consume_task.cancel()
             try:
                 await self._consume_task
             except (asyncio.CancelledError, Exception):

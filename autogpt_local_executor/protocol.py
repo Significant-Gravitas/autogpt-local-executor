@@ -142,6 +142,16 @@ class MessageType(str, Enum):
     LOCAL_LLM_COMPLETION = "LOCAL_LLM_COMPLETION"
     LOCAL_LLM_COMPLETION_CHUNK = "LOCAL_LLM_COMPLETION_CHUNK"
     LOCAL_LLM_COMPLETION_RESPONSE = "LOCAL_LLM_COMPLETION_RESPONSE"
+    # Workflow recording (see docs/WORKFLOW_RECORDING.md §6).
+    START_RECORDING = "START_RECORDING"
+    RECORDING_STARTED = "RECORDING_STARTED"
+    STOP_RECORDING = "STOP_RECORDING"
+    RECORDING_SUMMARY = "RECORDING_SUMMARY"
+    RECORDING_FETCH = "RECORDING_FETCH"
+    RECORDING_DATA = "RECORDING_DATA"
+    # Unsolicited co-pilot-mode step stream — modeled like STATUS: not acked,
+    # not counted against in-flight / max_concurrent, never auto-retried.
+    RECORDING_STEP = "RECORDING_STEP"
 
 
 class ErrorCode(str, Enum):
@@ -170,6 +180,15 @@ class ErrorCode(str, Enum):
     MODEL_NOT_AVAILABLE = "MODEL_NOT_AVAILABLE"
     LOCAL_LLM_BUSY = "LOCAL_LLM_BUSY"
     LOCAL_LLM_FAILED = "LOCAL_LLM_FAILED"
+    # Workflow recording additions (see docs/WORKFLOW_RECORDING.md §6).
+    RECORDING_NOT_FOUND = "RECORDING_NOT_FOUND"
+    RECORDING_CHANNEL_UNAVAILABLE = "RECORDING_CHANNEL_UNAVAILABLE"
+    RECORDING_ALREADY_ACTIVE = "RECORDING_ALREADY_ACTIVE"
+    # START_RECORDING arrived without a valid shim-issued consent token.
+    CONSENT_REQUIRED = "CONSENT_REQUIRED"
+    # The requested interpretation_route needs a local model the machine
+    # lacks, and the user declined the cloud fallback (§9.1, §10).
+    INTERPRETATION_UNAVAILABLE = "INTERPRETATION_UNAVAILABLE"
 
 
 class Platform(str, Enum):
@@ -642,6 +661,205 @@ class LocalLLMCompletionResponsePayload(_Payload):
     duration_seconds: float
 
 
+# ── Workflow recording (see docs/WORKFLOW_RECORDING.md) ──────────────────────
+
+# Interaction modes (§2). Demonstration buffers + fetch; co-pilot streams.
+RecordingMode = Literal["demonstration", "copilot"]
+
+# On-device interpretation routes (§3). The default keeps pixels local;
+# screenshots_to_cloud is the only route that crosses a new privacy line and
+# therefore the only one that needs the §9.1 consent prompt.
+InterpretationRoute = Literal[
+    "extract_then_cloud",  # default — text/structure only leaves the machine
+    "local_vlm",  # zero-cloud upgrade; a local VLM authors the skill
+    "screenshots_to_cloud",  # fallback; gated on the shim-enforced consent
+]
+
+# Capture channels (§4). The floor is universal; browser/desktop_ax enrich it.
+RecordingChannel = Literal["floor", "browser", "desktop_ax"]
+
+# Semantic verbs (§1.1) — intentful actions, not a raw input tape. `wait` and
+# `assert` are the replay-control verbs the recorder synthesizes or the user
+# adds (§9).
+SemanticAction = Literal[
+    "navigate",
+    "fill",
+    "select",
+    "click",
+    "submit",
+    "upload",
+    "launch_app",
+    "focus_window",
+    "copy",
+    "paste",
+    "run",
+    "file_op",
+    "wait",
+    "assert",
+]
+
+# Enrichment kind (§1). dom = browser DOM channel resolved selectors; ax =
+# desktop accessibility tree resolved a path; none = pure visual step, replay
+# degrades to vision grounding (§7) — not a failure, just lower fidelity.
+EnrichmentKind = Literal["dom", "ax", "none"]
+
+# Value type for the demonstrated input (§1). `secret` marks a field whose raw
+# value was dropped by best-effort hygiene redaction (§9).
+ValueType = Literal["text", "email", "number", "date", "secret", "file", "enum"]
+
+
+class Selector(BaseModel):
+    """One browser-DOM selector candidate. Replay tries these most-stable-first
+    (§7: id > name > label > role+text > xpath)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: str  # e.g. "id" | "name" | "label" | "role+text" | "xpath"
+    value: str
+
+
+class StepEnrichment(BaseModel):
+    """Additive structure on a step, present only when a channel resolved it.
+
+    `kind` discriminates the source. For `dom`, `selectors` is populated by the
+    browser channel; for `ax`, `ax_path` by the desktop a11y channel; for
+    `none`, neither resolved and replay falls back to visual grounding (§7).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: EnrichmentKind
+    selectors: list[Selector] = Field(default_factory=list)  # browser DOM only
+    ax_path: str | None = None  # desktop a11y only — element path in the AX tree
+    role: str | None = None
+    label: str | None = None
+    url: str | None = None
+
+
+class StepValue(BaseModel):
+    """The demonstrated input value for a step (§1).
+
+    `raw` is handled per interpretation route (§3). When best-effort hygiene
+    (§9) flags a secret, `raw` is set to null and `type` to `secret`.
+    `is_parameter` is None until inference is CONFIRMED during generalization
+    (§8) — never an auto-saved guess.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw: str | None = None
+    type: ValueType = "text"
+    is_parameter: bool | None = None
+
+
+class TrajectoryStep(BaseModel):
+    """One ordered step: what the user did + what the screen looked like (§1).
+
+    The floor fields (`action`, `screenshot_ref`, `cursor`, `active_app`,
+    `active_window`) are ALWAYS present and form the primary key. The
+    `enrichment` block is additive. `screenshot_ref` is a stub id — NEVER
+    inline image bytes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int
+    ts: float
+    actor: Literal["human", "agent"] = "human"
+
+    # --- the universal floor (always present) ---
+    action: SemanticAction
+    screenshot_ref: str  # pre-action frame, stub id — never inline bytes
+    cursor: tuple[int, int]  # where the action landed, display-global px
+    active_app: str
+    active_window: str
+
+    # --- enrichment: present only when the channel resolved it ---
+    enrichment: StepEnrichment = Field(default_factory=lambda: StepEnrichment(kind="none"))
+
+    value: StepValue = Field(default_factory=StepValue)
+
+    narration: str | None = None  # co-pilot mode live narration
+    outcome: Literal["ok", "error", "unknown"] = "ok"
+    redacted: bool = False
+
+
+class WorkflowRecording(BaseModel):
+    """A full recording: ordered trajectory + metadata (§1).
+
+    Carried in RECORDING_DATA after redaction. `redaction_applied` reflects
+    that best-effort hygiene ran (§9) — it is NOT a guarantee that all secrets
+    were caught; the real privacy control is `interpretation_route` (§3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recording_id: str  # "rec_<uuid>" — shim-minted, never reused
+    version: str = "1.0"
+    created_at: float
+    machine_id: str
+    interpretation_route: InterpretationRoute
+    steps: list[TrajectoryStep] = Field(default_factory=list)
+    redaction_applied: bool = True
+
+
+class EnrichmentCoverage(BaseModel):
+    """Per-kind step counts for the recording summary (§6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dom: int = 0
+    ax: int = 0
+    none: int = 0
+
+
+class StartRecordingPayload(_Payload):
+    """platform → shim. `consent_token` is REQUIRED and must be a valid
+    shim-issued token — the platform cannot self-assert consent (§9). A START
+    without a valid token gets CONSENT_REQUIRED."""
+
+    mode: RecordingMode
+    interpretation_route: InterpretationRoute = "extract_then_cloud"
+    channels: list[RecordingChannel] = Field(default_factory=lambda: ["floor"])
+    consent_token: str
+
+
+class RecordingStartedPayload(_Payload):
+    recording_id: str
+
+
+class StopRecordingPayload(_Payload):
+    recording_id: str
+
+
+class RecordingSummaryPayload(_Payload):
+    recording_id: str
+    step_count: int
+    enrichment_coverage: EnrichmentCoverage = Field(default_factory=EnrichmentCoverage)
+    duration_seconds: float
+
+
+class RecordingFetchPayload(_Payload):
+    recording_id: str
+
+
+class RecordingDataPayload(_Payload):
+    """The full WorkflowRecording, post-redaction (§6)."""
+
+    recording: WorkflowRecording
+
+
+class RecordingStepPayload(_Payload):
+    """One streamed step (co-pilot mode only).
+
+    Unsolicited, non-acked, out-of-band — modeled like STATUS. Carries the
+    recording_id so the platform can correlate, plus the step itself.
+    """
+
+    recording_id: str
+    step: TrajectoryStep
+
+
 # ── Envelopes ────────────────────────────────────────────────────────────────
 
 
@@ -872,6 +1090,44 @@ class LocalLLMCompletionResponseMessage(_Envelope):
     payload: LocalLLMCompletionResponsePayload
 
 
+class StartRecordingMessage(_Envelope):
+    type: Literal[MessageType.START_RECORDING] = MessageType.START_RECORDING
+    payload: StartRecordingPayload
+
+
+class RecordingStartedMessage(_Envelope):
+    type: Literal[MessageType.RECORDING_STARTED] = MessageType.RECORDING_STARTED
+    payload: RecordingStartedPayload
+
+
+class StopRecordingMessage(_Envelope):
+    type: Literal[MessageType.STOP_RECORDING] = MessageType.STOP_RECORDING
+    payload: StopRecordingPayload
+
+
+class RecordingSummaryMessage(_Envelope):
+    type: Literal[MessageType.RECORDING_SUMMARY] = MessageType.RECORDING_SUMMARY
+    payload: RecordingSummaryPayload
+
+
+class RecordingFetchMessage(_Envelope):
+    type: Literal[MessageType.RECORDING_FETCH] = MessageType.RECORDING_FETCH
+    payload: RecordingFetchPayload
+
+
+class RecordingDataMessage(_Envelope):
+    type: Literal[MessageType.RECORDING_DATA] = MessageType.RECORDING_DATA
+    payload: RecordingDataPayload
+
+
+class RecordingStepMessage(_Envelope):
+    """Unsolicited co-pilot-mode step frame. Like STATUS, the daemon sends it
+    outside the request/response accounting and never expects an ACK."""
+
+    type: Literal[MessageType.RECORDING_STEP] = MessageType.RECORDING_STEP
+    payload: RecordingStepPayload
+
+
 # Discriminated union — used when parsing inbound frames.
 Message = Annotated[
     HelloMessage
@@ -913,7 +1169,14 @@ Message = Annotated[
     | StatusMessage
     | LocalLLMCompletionMessage
     | LocalLLMCompletionChunkMessage
-    | LocalLLMCompletionResponseMessage,
+    | LocalLLMCompletionResponseMessage
+    | StartRecordingMessage
+    | RecordingStartedMessage
+    | StopRecordingMessage
+    | RecordingSummaryMessage
+    | RecordingFetchMessage
+    | RecordingDataMessage
+    | RecordingStepMessage,
     Field(discriminator="type"),
 ]
 
@@ -1003,6 +1266,8 @@ __all__ = [
     "DisplayInfoResponsePayload",
     "DisplayMonitor",
     "Encoding",
+    "EnrichmentCoverage",
+    "EnrichmentKind",
     "ErrorCode",
     "ErrorMessage",
     "ErrorPayload",
@@ -1034,6 +1299,7 @@ __all__ = [
     "HelloPayload",
     "InputActionMessage",
     "InputActionPayload",
+    "InterpretationRoute",
     "LocalLLMCompletionChunkMessage",
     "LocalLLMCompletionChunkPayload",
     "LocalLLMCompletionMessage",
@@ -1053,18 +1319,41 @@ __all__ = [
     "PingPongPayload",
     "Platform",
     "PongMessage",
+    "RecordingChannel",
+    "RecordingDataMessage",
+    "RecordingDataPayload",
+    "RecordingFetchMessage",
+    "RecordingFetchPayload",
+    "RecordingMode",
+    "RecordingStartedMessage",
+    "RecordingStartedPayload",
+    "RecordingStepMessage",
+    "RecordingStepPayload",
+    "RecordingSummaryMessage",
+    "RecordingSummaryPayload",
     "ScreenshotRequestMessage",
     "ScreenshotRequestPayload",
     "ScreenshotResponseMessage",
     "ScreenshotResponseMeta",
     "ScreenshotResponsePayload",
     "SESSION_REVOKED_REASONS",
+    "Selector",
+    "SemanticAction",
     "SessionRevokedMessage",
     "SessionRevokedPayload",
     "Shell",
+    "StartRecordingMessage",
+    "StartRecordingPayload",
     "StatusMessage",
     "StatusPayload",
+    "StepEnrichment",
+    "StepValue",
+    "StopRecordingMessage",
+    "StopRecordingPayload",
+    "TrajectoryStep",
     "ValidationError",
+    "ValueType",
+    "WorkflowRecording",
     "WindowFocusMessage",
     "WindowFocusPayload",
     "WindowInfo",

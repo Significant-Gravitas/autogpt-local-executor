@@ -223,6 +223,26 @@ class FileFormat(str, Enum):
     BYTES = "bytes"
 
 
+# ── Workflow-recording type aliases (see docs/WORKFLOW_RECORDING.md) ──────────
+# Defined here (ahead of the payload models) because HELLO advertises recording
+# channels + routes. The recording payload/step models live further down.
+
+# Interaction modes (§2). Demonstration buffers + fetch; co-pilot streams.
+RecordingMode = Literal["demonstration", "copilot"]
+
+# On-device interpretation routes (§3). The default keeps pixels local;
+# screenshots_to_cloud is the only route that crosses a new privacy line and
+# therefore the only one that needs the §9.1 consent prompt.
+InterpretationRoute = Literal[
+    "extract_then_cloud",  # default — text/structure only leaves the machine
+    "local_vlm",  # zero-cloud upgrade; a local VLM authors the skill
+    "screenshots_to_cloud",  # fallback; gated on the shim-enforced consent
+]
+
+# Capture channels (§4). The floor is universal; browser/desktop_ax enrich it.
+RecordingChannel = Literal["floor", "browser", "desktop_ax"]
+
+
 # ── Payload models ───────────────────────────────────────────────────────────
 
 
@@ -245,6 +265,14 @@ class HelloPayload(_Payload):
     # Computer-use feature advertisement, per COMPUTER_USE.md.
     computer_use_features: list[str] = Field(default_factory=list)
     computer_use_features_coarse: list[str] = Field(default_factory=list)
+    # Workflow-recording advertisement (see docs/WORKFLOW_RECORDING.md §6).
+    # `recording_channels` are the capture channels this shim can offer (floor
+    # is universal; browser/desktop_ax light up as their enrichers land).
+    # `recording_routes` are the interpretation routes available on this
+    # machine right now — so the platform can gate route selection. Empty when
+    # the recording capability isn't advertised.
+    recording_channels: list[RecordingChannel] = Field(default_factory=list)
+    recording_routes: list[InterpretationRoute] = Field(default_factory=list)
     # Highest wire-protocol version this shim supports. "major.minor".
     # Receiving side negotiates the effective version (see VERSION docs).
     protocol_version: str = VERSION
@@ -662,21 +690,6 @@ class LocalLLMCompletionResponsePayload(_Payload):
 
 
 # ── Workflow recording (see docs/WORKFLOW_RECORDING.md) ──────────────────────
-
-# Interaction modes (§2). Demonstration buffers + fetch; co-pilot streams.
-RecordingMode = Literal["demonstration", "copilot"]
-
-# On-device interpretation routes (§3). The default keeps pixels local;
-# screenshots_to_cloud is the only route that crosses a new privacy line and
-# therefore the only one that needs the §9.1 consent prompt.
-InterpretationRoute = Literal[
-    "extract_then_cloud",  # default — text/structure only leaves the machine
-    "local_vlm",  # zero-cloud upgrade; a local VLM authors the skill
-    "screenshots_to_cloud",  # fallback; gated on the shim-enforced consent
-]
-
-# Capture channels (§4). The floor is universal; browser/desktop_ax enrich it.
-RecordingChannel = Literal["floor", "browser", "desktop_ax"]
 
 # Semantic verbs (§1.1) — intentful actions, not a raw input tape. `wait` and
 # `assert` are the replay-control verbs the recorder synthesizes or the user

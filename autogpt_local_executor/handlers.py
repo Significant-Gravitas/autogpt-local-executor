@@ -83,17 +83,38 @@ from .protocol import (
     PermissionsCheckRequestMessage,
     PermissionsCheckResponseMessage,
     PermissionsCheckResponsePayload,
+    RecordingDataMessage,
+    RecordingDataPayload,
+    RecordingFetchMessage,
+    RecordingStartedMessage,
+    RecordingStartedPayload,
+    RecordingStepMessage,
+    RecordingStepPayload,
+    RecordingSummaryMessage,
+    RecordingSummaryPayload,
     ScreenshotRequestMessage,
     ScreenshotResponseMessage,
     ScreenshotResponseMeta,
     ScreenshotResponsePayload,
+    StartRecordingMessage,
+    StopRecordingMessage,
     WindowFocusMessage,
     WindowListRequestMessage,
     WindowListResponseMessage,
     WindowListResponsePayload,
     make_ack,
     make_error,
+    new_id,
     now_ts,
+)
+from .recording import (
+    A11yEnricher,
+    CaptureSource,
+    ConsentBroker,
+    ConsentError,
+    RecordingSession,
+    ScreenshotActionFloor,
+    probe_interpretation_route,
 )
 
 # Kept for legacy tests that monkeypatch h_mod._pyautogui / h_mod._Image.
@@ -1805,6 +1826,267 @@ def _local_llm_error_message(code: ErrorCode, backend_error: str) -> str:
     return f"Local LLM backend failed: {backend_error[:200]}"
 
 
+# ── Workflow recording ────────────────────────────────────────────────────────
+
+
+class RecordingHandler:
+    """Handles START / STOP / FETCH recording wire ops (§6).
+
+    Enforces one-recording-at-a-time (RECORDING_ALREADY_ACTIVE), validates the
+    shim-issued consent token (CONSENT_REQUIRED), probes/honors the
+    interpretation route, spins a RecordingSession, and consumes the
+    CaptureSource:
+
+      * co-pilot mode → streams RECORDING_STEP frames via the STATUS-frame send
+        path, so they're exempt from in-flight accounting (§6).
+      * demonstration mode → buffers silently; the platform pulls via
+        RECORDING_FETCH after STOP + user approval (§6).
+
+    Audit is content-free per §9: recording_id, channels, step_count,
+    interpretation_route — NEVER step content.
+
+    The CaptureSource is injected (`capture_factory`) so tests drive a scripted
+    MockCaptureSource and production wires the real floor + a11y enricher.
+    """
+
+    def __init__(
+        self,
+        config: ShimConfig,
+        audit: AuditWriter | None = None,
+        *,
+        consent_broker: ConsentBroker | None = None,
+        capture_factory: Any | None = None,
+    ) -> None:
+        self.config = config
+        self.audit = audit
+        self.consent = consent_broker or ConsentBroker()
+        # capture_factory(session) -> CaptureSource. Defaults to the real floor
+        # (+ a11y enricher) wrapping the computer-use backend. Tests inject a
+        # scripted MockCaptureSource here.
+        self._capture_factory = capture_factory or self._default_capture_factory
+        self._session: RecordingSession | None = None
+        # The background task draining the CaptureSource (co-pilot streaming or
+        # demonstration buffering).
+        self._consume_task: asyncio.Task[None] | None = None
+
+    # ── Capture wiring (the seam) ─────────────────────────────────────────
+
+    def _default_capture_factory(self, session: RecordingSession) -> CaptureSource:
+        """Build the production capture chain: floor → a11y enricher.
+
+        The floor's input-event source is the genuinely OS-specific part and is
+        NOT available here — until a real per-OS input-hook producer lands, this
+        floor has no events to snapshot and the chain yields nothing. The
+        RecordingHandler still functions (start/stop/fetch); it just records an
+        empty trajectory. Tests inject a MockCaptureSource instead.
+        """
+        from .recording import MockCaptureSource
+
+        # TODO(os-native): replace MockCaptureSource([]) with the real OS
+        # input-hook CaptureSource (CGEventTap / SetWindowsHookEx / XRecord).
+        input_events: CaptureSource = MockCaptureSource([])
+        floor = ScreenshotActionFloor(input_events=input_events, config=self.config)
+        return A11yEnricher(floor=floor)
+
+    # ── Dispatch ──────────────────────────────────────────────────────────
+
+    async def handle(self, msg: Any, *, send: Any | None = None) -> Any:
+        if not self.config.enable_recording:
+            return make_error(
+                msg.id,
+                ErrorCode.CAPABILITY_NOT_GRANTED,
+                "Workflow recording is not enabled on this shim.",
+            )
+        if isinstance(msg, StartRecordingMessage):
+            return await self._start(msg, send=send)
+        if isinstance(msg, StopRecordingMessage):
+            return await self._stop(msg)
+        if isinstance(msg, RecordingFetchMessage):
+            return await self._fetch(msg)
+        return make_error(
+            msg.id,
+            ErrorCode.INTERNAL_ERROR,
+            f"Unknown recording message: {type(msg).__name__}",
+        )
+
+    # ── START ─────────────────────────────────────────────────────────────
+
+    async def _start(self, msg: StartRecordingMessage, *, send: Any | None) -> Any:
+        p = msg.payload
+
+        # One-at-a-time. A START while a session is live → RECORDING_ALREADY_ACTIVE.
+        if self._session is not None and self._session.is_active:
+            return make_error(
+                msg.id,
+                ErrorCode.RECORDING_ALREADY_ACTIVE,
+                "A recording is already in progress.",
+                details={"recording_id": self._session.recording_id},
+            )
+
+        # Consent: the token must be a valid, shim-issued, single-use token.
+        # A platform that self-asserts (no/forged token) gets CONSENT_REQUIRED.
+        try:
+            self.consent.validate_consent_token(p.consent_token, mode=p.mode)
+        except ConsentError as exc:
+            return make_error(
+                msg.id,
+                ErrorCode.CONSENT_REQUIRED,
+                f"Valid shim-issued consent token required: {exc}",
+            )
+
+        # Probe / honor the interpretation route. We don't drive the §9.1 cloud
+        # consent dialog here (the token already gated the recording); the
+        # decision's requires_consent informs the platform via details.
+        decision = probe_interpretation_route(
+            channels=p.channels,
+            local_llm_models=list(self._advertised_models()),
+            requested=p.interpretation_route,
+        )
+
+        session = RecordingSession(
+            machine_id=self.config.machine_id,
+            mode=p.mode,
+            interpretation_route=decision.route,
+            channels=list(p.channels),
+            buffer_dir=self.config.derived_recording_buffer_dir,
+        )
+        session.start()
+        self._session = session
+
+        await self._audit_lifecycle("RECORDING_STARTED", session)
+
+        # Begin consuming the capture source. Co-pilot streams; demonstration
+        # buffers silently.
+        stream = p.mode == "copilot"
+        self._consume_task = asyncio.create_task(
+            self._consume(session, send=send if stream else None, stream=stream)
+        )
+
+        return RecordingStartedMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=RecordingStartedPayload(recording_id=session.recording_id),
+        )
+
+    def _advertised_models(self) -> list[str]:
+        """Local LLM model list for the route probe — empty when unknown.
+
+        The daemon owns the authoritative probed list; here we stay decoupled
+        and let an empty list mean 'no local VLM' (the conservative default).
+        """
+        return []
+
+    async def _consume(
+        self,
+        session: RecordingSession,
+        *,
+        send: Any | None,
+        stream: bool,
+    ) -> None:
+        """Drain the CaptureSource into the session.
+
+        In co-pilot mode (`stream=True`, `send` provided) each step is emitted
+        as an unsolicited RECORDING_STEP frame via the STATUS-frame send path —
+        exempt from in-flight / max_concurrent accounting (§6). In
+        demonstration mode the step is only buffered; the platform fetches
+        after STOP + approval.
+        """
+        source = self._capture_factory(session)
+        try:
+            async for step in source.steps():
+                session.append(step)
+                if stream and send is not None:
+                    frame = RecordingStepMessage(
+                        id=new_id(),
+                        ts=now_ts(),
+                        payload=RecordingStepPayload(
+                            recording_id=session.recording_id,
+                            step=step,
+                        ),
+                    )
+                    try:
+                        await send(frame)
+                    except Exception:
+                        logger.debug("Failed to send RECORDING_STEP frame", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Recording capture loop crashed for %s", session.recording_id)
+
+    # ── STOP ──────────────────────────────────────────────────────────────
+
+    async def _stop(self, msg: StopRecordingMessage) -> Any:
+        session = self._session
+        if session is None or session.recording_id != msg.payload.recording_id:
+            return make_error(
+                msg.id,
+                ErrorCode.RECORDING_NOT_FOUND,
+                f"No active recording with id {msg.payload.recording_id!r}.",
+            )
+
+        # Let the capture loop finish draining, then finalize.
+        if self._consume_task is not None:
+            self._consume_task.cancel()
+            try:
+                await self._consume_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._consume_task = None
+
+        session.stop()
+        await self._audit_lifecycle("RECORDING_STOPPED", session)
+
+        return RecordingSummaryMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=RecordingSummaryPayload(
+                recording_id=session.recording_id,
+                step_count=session.step_count,
+                enrichment_coverage=session.enrichment_coverage(),
+                duration_seconds=round(session.duration_seconds(), 3),
+            ),
+        )
+
+    # ── FETCH ─────────────────────────────────────────────────────────────
+
+    async def _fetch(self, msg: RecordingFetchMessage) -> Any:
+        session = self._session
+        if session is None or session.recording_id != msg.payload.recording_id:
+            return make_error(
+                msg.id,
+                ErrorCode.RECORDING_NOT_FOUND,
+                f"No recording with id {msg.payload.recording_id!r}.",
+            )
+        await self._audit_lifecycle("RECORDING_FETCHED", session)
+        return RecordingDataMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=RecordingDataPayload(recording=session.to_recording()),
+        )
+
+    # ── Audit (content-free, §9) ──────────────────────────────────────────
+
+    async def _audit_lifecycle(self, op: str, session: RecordingSession) -> None:
+        """Emit a content-free recording-lifecycle audit record (§9).
+
+        Records recording_id, channels, step_count, interpretation_route, mode
+        — NEVER step content (no actions, values, screenshots, narration).
+        """
+        if self.audit is None:
+            return
+        details = {
+            "recording_id": session.recording_id,
+            "channels": list(session.channels),
+            "step_count": session.step_count,
+            "interpretation_route": session.interpretation_route,
+            "mode": session.mode,
+        }
+        try:
+            await self.audit.write(op, request_id=None, details=details)
+        except Exception:
+            logger.debug("Failed to write %s audit record", op, exc_info=True)
+
+
 __all__ = [
     "CommandHandler",
     "ComputerUseHandler",
@@ -1812,4 +2094,5 @@ __all__ = [
     "LocalLLMHandler",
     "OllamaBackend",
     "OllamaBackendError",
+    "RecordingHandler",
 ]

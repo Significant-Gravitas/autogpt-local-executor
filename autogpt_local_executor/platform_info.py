@@ -77,6 +77,7 @@ def detect_capabilities(
     enable_computer_use: bool = False,
     enable_local_llm: bool = False,
     enable_hardware: bool = False,
+    enable_recording: bool = False,
 ) -> list[str]:
     """Return the list of capabilities to advertise in HELLO.
 
@@ -101,6 +102,11 @@ def detect_capabilities(
             caps.append("hardware_usb")
         if _module_available("RPi.GPIO"):
             caps.append("hardware_gpio")
+    # Recording requires the universal screenshot+action floor, which wraps the
+    # same backend computer_use uses. Only advertise when the floor is
+    # available. See docs/WORKFLOW_RECORDING.md §4, §6.
+    if enable_recording and _can_do_computer_use():
+        caps.append("recording")
     return caps
 
 

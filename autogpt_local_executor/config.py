@@ -154,6 +154,39 @@ class ShimConfig(BaseSettings):
         "docs/COMPUTER_USE.md Q3.",
     )
 
+    # ── Workflow recording (see docs/WORKFLOW_RECORDING.md) ────────────────
+    enable_recording: bool = Field(
+        default=False,
+        description="Advertise the 'recording' capability and accept "
+        "START_RECORDING. Requires the screenshot floor (computer_use). See "
+        "docs/WORKFLOW_RECORDING.md §6.",
+    )
+    recording_buffer_dir: Path | None = Field(
+        default=None,
+        description="Directory for the encrypted recording buffer. Defaults "
+        "to a 'recordings' subdir next to the audit log. Buffers are "
+        "secure-erased after skill generation unless pinned (§9).",
+    )
+    recording_default_interpretation_route: str = Field(
+        default="extract_then_cloud",
+        description="Default interpretation route when the platform doesn't "
+        "pin one and the probe is inconclusive. See WORKFLOW_RECORDING.md §3.",
+    )
+    recording_channels: list[str] = Field(
+        default_factory=lambda: ["floor"],
+        description="Capture channels this shim can offer. 'floor' is the "
+        "universal baseline; 'browser'/'desktop_ax' light up as their "
+        "enrichers land. Advertised to the platform so it can gate.",
+    )
+
+    @property
+    def derived_recording_buffer_dir(self) -> Path:
+        """Resolved recording buffer dir — explicit override, else next to the
+        audit log."""
+        if self.recording_buffer_dir is not None:
+            return self.recording_buffer_dir
+        return self.audit_log_path.parent / "recordings"
+
     @property
     def derived_ws_url(self) -> str:
         if self.platform_ws_url:
@@ -192,7 +225,7 @@ def load_config(
         with open(path, "rb") as f:
             file_overrides = tomllib.load(f)
         # Coerce string paths into Path objects so pydantic doesn't choke.
-        for key in ("allowed_root", "audit_log_path"):
+        for key in ("allowed_root", "audit_log_path", "recording_buffer_dir"):
             if key in file_overrides and isinstance(file_overrides[key], str):
                 file_overrides[key] = Path(file_overrides[key])
     merged = {**file_overrides, **overrides}

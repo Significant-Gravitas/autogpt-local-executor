@@ -26,7 +26,13 @@ from . import platform_info
 from .audit import AuditWriter, get_or_create_audit_key
 from .auth import KeychainTokenStore
 from .config import ShimConfig
-from .handlers import CommandHandler, ComputerUseHandler, FileHandler, LocalLLMHandler
+from .handlers import (
+    CommandHandler,
+    ComputerUseHandler,
+    FileHandler,
+    LocalLLMHandler,
+    RecordingHandler,
+)
 from .protocol import (
     VERSION as PROTOCOL_VERSION,
 )
@@ -53,8 +59,11 @@ from .protocol import (
     PermissionsCheckRequestMessage,
     PingMessage,
     ProtocolVersionMismatch,
+    RecordingFetchMessage,
     ScreenshotRequestMessage,
     SessionRevokedMessage,
+    StartRecordingMessage,
+    StopRecordingMessage,
     StatusMessage,
     StatusPayload,
     WindowFocusMessage,
@@ -130,6 +139,7 @@ class ShimDaemon:
         self._command_handler = CommandHandler(config, audit=self.audit)
         self._computer_handler = ComputerUseHandler(config, audit=self.audit)
         self._local_llm_handler = LocalLLMHandler(config, audit=self.audit)
+        self._recording_handler = RecordingHandler(config, audit=self.audit)
         self._running = False
         self._ws: Any = None
         self._semaphore: asyncio.Semaphore | None = None
@@ -450,6 +460,7 @@ class ShimDaemon:
             enable_computer_use=cfg.enable_computer_use,
             enable_local_llm=cfg.enable_local_llm,
             enable_hardware=cfg.enable_hardware,
+            enable_recording=cfg.enable_recording,
         )
         screen = platform_info.detect_screen_resolution()
         cu_features: list[str] = []
@@ -476,6 +487,17 @@ class ShimDaemon:
                 # Probe failed or returned no models — strip the capability
                 # so the platform doesn't try to route to us.
                 caps = [c for c in caps if c != "local_llm"]
+        # Recording advertisement: only when the capability is on. Channels are
+        # what this shim can offer; routes are what this machine can interpret
+        # with right now, so the platform can gate (§6).
+        recording_channels: list[str] = []
+        recording_routes: list[str] = []
+        if "recording" in caps:
+            recording_channels = list(cfg.recording_channels)
+            recording_routes = self._available_recording_routes(
+                channels=recording_channels,
+                local_llm_models=local_llm_models,
+            )
         payload = HelloPayload(
             shim_version=__import__("autogpt_local_executor").__version__,
             machine_id=cfg.machine_id,
@@ -488,9 +510,37 @@ class ShimDaemon:
             hardware_devices=[],
             computer_use_features=cu_features,
             computer_use_features_coarse=cu_features_coarse,
+            recording_channels=recording_channels,  # type: ignore[arg-type]
+            recording_routes=recording_routes,  # type: ignore[arg-type]
             protocol_version=PROTOCOL_VERSION,
         )
         return HelloMessage(id=new_id(), ts=now_ts(), payload=payload)
+
+    @staticmethod
+    def _available_recording_routes(
+        *,
+        channels: list[str],
+        local_llm_models: list[str],
+    ) -> list[str]:
+        """Interpretation routes this machine can offer (see §3.1 probes).
+
+        screenshots_to_cloud is always offered (the consent-gated fallback);
+        extract_then_cloud when structured channels or OCR are present;
+        local_vlm when a capable local vision model is listed. The platform
+        gates its per-recording choice against this set.
+        """
+        from .recording.route import (
+            _local_vlm_present,
+            _ocr_available,
+            _structured_channels_present,
+        )
+
+        routes: list[str] = ["screenshots_to_cloud"]
+        if _structured_channels_present(channels) or _ocr_available():
+            routes.insert(0, "extract_then_cloud")
+        if _local_vlm_present(local_llm_models):
+            routes.append("local_vlm")
+        return routes
 
     # ── Frame dispatch ────────────────────────────────────────────────────
 
@@ -740,6 +790,14 @@ class ShimDaemon:
             return await self._computer_handler.handle(msg)
         if isinstance(msg, LocalLLMCompletionMessage):
             return await self._local_llm_handler.handle(msg, send=send)
+        if isinstance(
+            msg, (StartRecordingMessage, StopRecordingMessage, RecordingFetchMessage)
+        ):
+            # START/STOP/FETCH are request/response ops that count against
+            # in-flight (§6). The `send` callback lets START stream unsolicited
+            # RECORDING_STEP frames in co-pilot mode (exempt from accounting,
+            # like STATUS) while the terminal response flows the normal path.
+            return await self._recording_handler.handle(msg, send=send)
         # Anything else (e.g., responses we didn't ask for) is silently dropped.
         logger.debug("No handler for %s; dropping", type(msg).__name__)
         return None

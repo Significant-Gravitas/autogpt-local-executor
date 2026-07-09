@@ -231,7 +231,6 @@ async def test_streaming_dispatch_emits_chunks_and_terminal_response(tmp_path: P
 
     backend.chat_stream = fake_stream
     handler = LocalLLMHandler(cfg, backend=backend)
-    await handler.probe.__call__ if False else None  # noqa: no probe — skip pre-check
     # Cache-empty so the pre-check is a no-op (we want to test the streaming path).
     handler._models = []
 

@@ -80,13 +80,13 @@ def test_default_audit_log_path_linux(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     with patch.object(platform_info, "detect_platform", return_value="linux"):
         p = platform_info.default_audit_log_path()
-        assert str(p).endswith(".local/state/autogpt-local-executor/audit.log")
+        assert p.as_posix().endswith(".local/state/autogpt-local-executor/audit.log")
 
 
 def test_default_audit_log_path_macos() -> None:
     with patch.object(platform_info, "detect_platform", return_value="darwin"):
         p = platform_info.default_audit_log_path()
-        assert "Library/Logs/autogpt-local-executor" in str(p)
+        assert "Library/Logs/autogpt-local-executor" in p.as_posix()
 
 
 def test_default_audit_log_path_windows(monkeypatch: pytest.MonkeyPatch) -> None:

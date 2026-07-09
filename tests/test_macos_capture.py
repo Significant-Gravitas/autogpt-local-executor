@@ -15,12 +15,10 @@ import sys
 
 import pytest
 
-quartz = pytest.importorskip("Quartz", reason="pyobjc Quartz not installed")
-pytestmark = pytest.mark.skipif(
-    sys.platform != "darwin", reason="macOS capture is darwin-only"
-)
-
 from autogpt_local_executor.recording.macos_capture import MacInputCaptureSource
+
+quartz = pytest.importorskip("Quartz", reason="pyobjc Quartz not installed")
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS capture is darwin-only")
 
 
 def _real_mouse_event(x: int, y: int):

@@ -298,6 +298,19 @@ Same machinery, fidelity scales with what the app exposes.
 
 ```jsonc
 // platform → shim  (request/response — counts against in-flight)
+{"type": "REQUEST_RECORDING_CONSENT", "payload": {
+   "mode": "copilot",
+   "interpretation_route": "extract_then_cloud",
+   "channels": ["floor", "browser", "desktop_ax"]
+}}
+{"type": "RECORDING_CONSENT_RESULT", "payload": {
+   "approved": true,
+   "mode": "copilot",
+   "interpretation_route": "extract_then_cloud",
+   "consent_token": "<single-use shim-issued token>",
+   "expires_at": 1760000000.0
+}}
+
 {"type": "START_RECORDING", "payload": {
    "mode": "copilot",                      // "demonstration" | "copilot"
    "interpretation_route": "extract_then_cloud",
@@ -312,6 +325,15 @@ Same machinery, fidelity scales with what the app exposes.
 
 {"type": "RECORDING_FETCH", "payload": {"recording_id": "..."}}
 {"type": "RECORDING_DATA",  "payload": { /* full WorkflowRecording, post-redaction */ }}
+
+{"type": "APPLY_RECORDING_REVIEW", "payload": {
+   "recording_id": "rec_<uuid>",
+   "removed_step_seqs": [2, 5],
+   "redacted_step_seqs": [3]
+}}
+{"type": "RECORDING_REVIEW_APPLIED", "payload": {
+   "recording_id": "rec_<uuid>", "step_count": 11
+}}
 ```
 
 **`RECORDING_STEP` is an unsolicited, non-acked, out-of-band stream**
@@ -319,7 +341,8 @@ Same machinery, fidelity scales with what the app exposes.
 `max_concurrent` / in-flight accounting and idempotency/retry** (the
 panel's load-bearing protocol fix). Demonstration mode does **not**
 stream; it buffers locally and the platform pulls via `RECORDING_FETCH`
-after `STOP` + user approval — which is also what keeps demonstration-mode
+after `STOP` + `APPLY_RECORDING_REVIEW` — which is also what makes the user's
+step removals and redactions authoritative before skill generation and keeps demonstration-mode
 data on the machine until the user consents to send it. (v0.1 contradicted
 itself by streaming *and* claiming local-until-approved; resolved: stream
 only in co-pilot mode, where live narration needs it and the user opted
@@ -376,12 +399,12 @@ clarifying question or a second row.
 
 ## 9. Consent, safety, security (panel must-fixes)
 
-- **Shim-enforced consent (not platform-asserted).** `START_RECORDING`
-  carries a `consent_token` the shim issues *only* after an OS-native,
-  shim-rendered confirmation the platform cannot script. A platform that
-  sends START without a valid token gets `CONSENT_REQUIRED`. The visible
-  recording indicator is shim-rendered (tray/menu-bar), not the
-  platform-controlled copilot UI.
+- **Shim-enforced consent (not platform-asserted).**
+  `REQUEST_RECORDING_CONSENT` renders a local shim confirmation and returns a
+  short-lived, single-use token only after approval. The token is bound to the
+  mode and effective interpretation route. `START_RECORDING` without that
+  exact token gets `CONSENT_REQUIRED`; an extract-only approval cannot be
+  reused for `screenshots_to_cloud`.
 - **Scoped capture.** Browser enrichment is **origin/active-form
   allow-listed** — it attaches to steps on the demonstrated origin, not
   every tab. The floor captures the active window only. No global

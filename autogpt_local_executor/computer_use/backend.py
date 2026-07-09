@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 from ..config import ShimConfig
 from ..protocol import (
@@ -217,7 +217,7 @@ class NullBackend(ComputerUseBackend):
     def features(self) -> list[str]:
         return []
 
-    def _refuse(self, feature: str) -> Any:
+    def _refuse(self, feature: str) -> NoReturn:
         from .errors import FeatureNotSupportedError
 
         raise FeatureNotSupportedError(feature, reason="no display reachable")

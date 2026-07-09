@@ -162,11 +162,11 @@ def detect_machine_id() -> str:
             try:
                 import winreg  # type: ignore[import-not-found]
 
-                with winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
+                with winreg.OpenKey(  # type: ignore[attr-defined]
+                    winreg.HKEY_LOCAL_MACHINE,  # type: ignore[attr-defined]
                     r"SOFTWARE\Microsoft\Cryptography",
                 ) as key:
-                    val, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    val, _ = winreg.QueryValueEx(key, "MachineGuid")  # type: ignore[attr-defined]
                     return str(val).lower()
             except OSError:
                 pass

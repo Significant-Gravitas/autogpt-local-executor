@@ -223,6 +223,44 @@ class RecordingSession:
             redaction_applied=True,
         )
 
+    def apply_review(
+        self,
+        *,
+        removed_step_seqs: list[int],
+        redacted_step_seqs: list[int],
+    ) -> int:
+        """Apply the user's review decisions to the authoritative local copy."""
+        if self._stopped_at is None:
+            raise RecordingError("recording must be stopped before review")
+
+        known = {step.seq for step in self._steps}
+        requested = set(removed_step_seqs) | set(redacted_step_seqs)
+        unknown = requested - known
+        if unknown:
+            raise RecordingError(f"review references unknown step sequence(s): {sorted(unknown)}")
+
+        removed = set(removed_step_seqs)
+        redacted = set(redacted_step_seqs) - removed
+        reviewed: list[TrajectoryStep] = []
+        for step in self._steps:
+            if step.seq in removed:
+                continue
+            if step.seq in redacted:
+                step = step.model_copy(
+                    update={
+                        "value": StepValue(
+                            raw=None,
+                            type="secret",
+                            is_parameter=step.value.is_parameter,
+                        ),
+                        "redacted": True,
+                    }
+                )
+            reviewed.append(step)
+        self._steps = reviewed
+        self._persist_buffer()
+        return len(self._steps)
+
     def enrichment_coverage(self) -> EnrichmentCoverage:
         """Per-kind step counts for the summary (§6)."""
         dom = ax = none = 0

@@ -20,15 +20,21 @@ from autogpt_local_executor.audit import AuditWriter
 from autogpt_local_executor.config import ShimConfig
 from autogpt_local_executor.handlers import RecordingHandler
 from autogpt_local_executor.protocol import (
+    ApplyRecordingReviewMessage,
+    ApplyRecordingReviewPayload,
     EnrichmentCoverage,
     ErrorCode,
     ErrorMessage,
+    RecordingConsentResultMessage,
     RecordingDataMessage,
     RecordingFetchMessage,
     RecordingFetchPayload,
+    RecordingReviewAppliedMessage,
     RecordingStartedMessage,
     RecordingStepMessage,
     RecordingSummaryMessage,
+    RequestRecordingConsentMessage,
+    RequestRecordingConsentPayload,
     StartRecordingMessage,
     StartRecordingPayload,
     StepEnrichment,
@@ -127,6 +133,14 @@ def _consent(broker: ConsentBroker, mode: str = "copilot") -> str:
     return broker.issue_consent_token(mode=mode, interpretation_route="extract_then_cloud")
 
 
+def _approve_consent(broker: ConsentBroker, *, mode: str, interpretation_route: str) -> str:
+    return broker.issue_consent_token(mode=mode, interpretation_route=interpretation_route)
+
+
+def _deny_consent(broker: ConsentBroker, *, mode: str, interpretation_route: str) -> None:
+    return None
+
+
 # ── Protocol round-trips (each new message type) ──────────────────────────────
 
 
@@ -145,6 +159,21 @@ def test_start_recording_round_trip() -> None:
     assert isinstance(again, StartRecordingMessage)
     assert again.payload.mode == "copilot"
     assert again.payload.channels == ["floor", "browser"]
+
+
+def test_request_recording_consent_round_trip() -> None:
+    msg = RequestRecordingConsentMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=RequestRecordingConsentPayload(
+            mode="copilot",
+            interpretation_route="screenshots_to_cloud",
+            channels=["floor"],
+        ),
+    )
+    again = parse_message(dump_message(msg))
+    assert isinstance(again, RequestRecordingConsentMessage)
+    assert again.payload.interpretation_route == "screenshots_to_cloud"
 
 
 def test_start_recording_requires_consent_token() -> None:
@@ -197,6 +226,22 @@ def test_recording_fetch_round_trip() -> None:
     again = parse_message(dump_message(msg))
     assert isinstance(again, RecordingFetchMessage)
     assert again.payload.recording_id == "rec_1"
+
+
+def test_apply_recording_review_round_trip() -> None:
+    msg = ApplyRecordingReviewMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=ApplyRecordingReviewPayload(
+            recording_id="rec_1",
+            removed_step_seqs=[2],
+            redacted_step_seqs=[1],
+        ),
+    )
+    again = parse_message(dump_message(msg))
+    assert isinstance(again, ApplyRecordingReviewMessage)
+    assert again.payload.removed_step_seqs == [2]
+    assert again.payload.redacted_step_seqs == [1]
 
 
 def test_recording_data_round_trip() -> None:
@@ -283,6 +328,35 @@ def test_session_append_after_stop_raises(tmp_path: Path) -> None:
     sess.stop()
     with pytest.raises(RecordingError):
         sess.append(_step(1))
+
+
+def test_session_review_removes_and_redacts_authoritative_steps(tmp_path: Path) -> None:
+    sess = _make_session(tmp_path)
+    sess.start()
+    sess.append(_step(1, raw="keep but hide"))
+    sess.append(_step(2, raw="remove"))
+    sess.append(_step(3, raw="keep"))
+    sess.stop()
+
+    count = sess.apply_review(removed_step_seqs=[2], redacted_step_seqs=[1])
+
+    recording = sess.to_recording()
+    assert count == 2
+    assert [step.seq for step in recording.steps] == [1, 3]
+    assert recording.steps[0].value.raw is None
+    assert recording.steps[0].value.type == "secret"
+    assert recording.steps[0].redacted is True
+
+
+def test_session_review_rejects_unknown_step(tmp_path: Path) -> None:
+    from autogpt_local_executor.recording import RecordingError
+
+    sess = _make_session(tmp_path)
+    sess.start()
+    sess.append(_step(1))
+    sess.stop()
+    with pytest.raises(RecordingError):
+        sess.apply_review(removed_step_seqs=[99], redacted_step_seqs=[])
 
 
 # ── Consent tokens (§9) ───────────────────────────────────────────────────────
@@ -422,6 +496,7 @@ async def test_one_recording_at_a_time(tmp_path: Path) -> None:
         cfg,
         consent_broker=broker,
         capture_factory=_capture_factory([]),  # empty → session stays active until STOP
+        recording_cipher=_TEST_CIPHER,
     )
 
     start1 = StartRecordingMessage(
@@ -449,10 +524,67 @@ async def test_one_recording_at_a_time(tmp_path: Path) -> None:
 # ── START consent enforcement via the handler ─────────────────────────────────
 
 
+async def test_request_consent_approved_token_starts_recording(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    broker = ConsentBroker()
+    handler = RecordingHandler(
+        cfg,
+        consent_broker=broker,
+        consent_prompt=_approve_consent,
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
+    )
+    request = RequestRecordingConsentMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=RequestRecordingConsentPayload(mode="copilot", channels=["floor"]),
+    )
+    consent = await handler.handle(request, send=None)
+    assert isinstance(consent, RecordingConsentResultMessage)
+    assert consent.payload.approved is True
+    assert consent.payload.consent_token
+    assert consent.payload.expires_at
+
+    start = StartRecordingMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=StartRecordingPayload(
+            mode=consent.payload.mode,
+            interpretation_route=consent.payload.interpretation_route,
+            channels=["floor"],
+            consent_token=consent.payload.consent_token,
+        ),
+    )
+    response = await handler.handle(start, send=None)
+    assert isinstance(response, RecordingStartedMessage)
+
+
+async def test_request_consent_denial_returns_no_token(tmp_path: Path) -> None:
+    handler = RecordingHandler(
+        _make_config(tmp_path),
+        consent_broker=ConsentBroker(),
+        consent_prompt=_deny_consent,
+        recording_cipher=_TEST_CIPHER,
+    )
+    request = RequestRecordingConsentMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=RequestRecordingConsentPayload(mode="copilot", channels=["floor"]),
+    )
+    consent = await handler.handle(request, send=None)
+    assert isinstance(consent, RecordingConsentResultMessage)
+    assert consent.payload.approved is False
+    assert consent.payload.consent_token is None
+    assert consent.payload.expires_at is None
+
+
 async def test_start_without_valid_token_returns_consent_required(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     handler = RecordingHandler(
-        cfg, consent_broker=ConsentBroker(), capture_factory=_capture_factory([])
+        cfg,
+        consent_broker=ConsentBroker(),
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
     )
     start = StartRecordingMessage(
         id=new_id(),
@@ -464,10 +596,39 @@ async def test_start_without_valid_token_returns_consent_required(tmp_path: Path
     assert resp.payload.code == ErrorCode.CONSENT_REQUIRED
 
 
+async def test_start_rejects_token_for_different_route(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    broker = ConsentBroker()
+    handler = RecordingHandler(
+        cfg,
+        consent_broker=broker,
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
+    )
+    start = StartRecordingMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=StartRecordingPayload(
+            mode="copilot",
+            interpretation_route="screenshots_to_cloud",
+            channels=["floor"],
+            consent_token=_consent(broker),
+        ),
+    )
+    response = await handler.handle(start, send=None)
+    assert isinstance(response, ErrorMessage)
+    assert response.payload.code == ErrorCode.CONSENT_REQUIRED
+
+
 async def test_start_with_valid_token_succeeds(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     broker = ConsentBroker()
-    handler = RecordingHandler(cfg, consent_broker=broker, capture_factory=_capture_factory([]))
+    handler = RecordingHandler(
+        cfg,
+        consent_broker=broker,
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
+    )
     start = StartRecordingMessage(
         id=new_id(),
         ts=now_ts(),
@@ -482,7 +643,7 @@ async def test_start_with_valid_token_succeeds(tmp_path: Path) -> None:
 
 async def test_recording_disabled_returns_capability_not_granted(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path, enable_recording=False)
-    handler = RecordingHandler(cfg, consent_broker=ConsentBroker())
+    handler = RecordingHandler(cfg, consent_broker=ConsentBroker(), recording_cipher=_TEST_CIPHER)
     start = StartRecordingMessage(
         id=new_id(),
         ts=now_ts(),
@@ -506,7 +667,11 @@ async def test_audit_entry_is_content_free(tmp_path: Path) -> None:
         _step(2, action="submit", raw=None, kind="none"),
     ]
     handler = RecordingHandler(
-        cfg, audit=audit, consent_broker=broker, capture_factory=_capture_factory(steps)
+        cfg,
+        audit=audit,
+        consent_broker=broker,
+        capture_factory=_capture_factory(steps),
+        recording_cipher=_TEST_CIPHER,
     )
 
     start = StartRecordingMessage(
@@ -571,7 +736,12 @@ async def test_demonstration_mode_does_not_stream(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     broker = ConsentBroker()
     steps = [_step(1, kind="dom"), _step(2, kind="dom")]
-    handler = RecordingHandler(cfg, consent_broker=broker, capture_factory=_capture_factory(steps))
+    handler = RecordingHandler(
+        cfg,
+        consent_broker=broker,
+        capture_factory=_capture_factory(steps),
+        recording_cipher=_TEST_CIPHER,
+    )
 
     sent: list[object] = []
 
@@ -615,7 +785,12 @@ async def test_copilot_mode_streams_recording_steps(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     broker = ConsentBroker()
     steps = [_step(1, kind="dom"), _step(2, kind="ax"), _step(3, kind="none")]
-    handler = RecordingHandler(cfg, consent_broker=broker, capture_factory=_capture_factory(steps))
+    handler = RecordingHandler(
+        cfg,
+        consent_broker=broker,
+        capture_factory=_capture_factory(steps),
+        recording_cipher=_TEST_CIPHER,
+    )
 
     sent: list[RecordingStepMessage] = []
 
@@ -646,6 +821,65 @@ async def test_copilot_mode_streams_recording_steps(tmp_path: Path) -> None:
     assert summary.payload.step_count == 3
 
 
+async def test_handler_review_changes_later_fetch(tmp_path: Path) -> None:
+    broker = ConsentBroker()
+    handler = RecordingHandler(
+        _make_config(tmp_path),
+        consent_broker=broker,
+        capture_factory=_capture_factory([_step(1), _step(2), _step(3)]),
+        recording_cipher=_TEST_CIPHER,
+    )
+    started = await handler.handle(
+        StartRecordingMessage(
+            id=new_id(),
+            ts=now_ts(),
+            payload=StartRecordingPayload(
+                mode="demonstration",
+                channels=["floor"],
+                consent_token=_consent(broker, mode="demonstration"),
+            ),
+        ),
+        send=None,
+    )
+    assert isinstance(started, RecordingStartedMessage)
+    recording_id = started.payload.recording_id
+    await handler.handle(
+        StopRecordingMessage(
+            id=new_id(),
+            ts=now_ts(),
+            payload=StopRecordingPayload(recording_id=recording_id),
+        ),
+        send=None,
+    )
+
+    reviewed = await handler.handle(
+        ApplyRecordingReviewMessage(
+            id=new_id(),
+            ts=now_ts(),
+            payload=ApplyRecordingReviewPayload(
+                recording_id=recording_id,
+                removed_step_seqs=[2],
+                redacted_step_seqs=[1],
+            ),
+        ),
+        send=None,
+    )
+    assert isinstance(reviewed, RecordingReviewAppliedMessage)
+    assert reviewed.payload.step_count == 2
+
+    fetched = await handler.handle(
+        RecordingFetchMessage(
+            id=new_id(),
+            ts=now_ts(),
+            payload=RecordingFetchPayload(recording_id=recording_id),
+        ),
+        send=None,
+    )
+    assert isinstance(fetched, RecordingDataMessage)
+    assert [step.seq for step in fetched.payload.recording.steps] == [1, 3]
+    assert fetched.payload.recording.steps[0].value.raw is None
+
+
 # ── End-to-end: MockCaptureSource drives a scripted recording ─────────────────
 
 
@@ -658,7 +892,12 @@ async def test_mock_capture_source_end_to_end(tmp_path: Path) -> None:
         _step(2, action="fill", raw="hunter2", kind="dom", label="Password", role="textbox"),
         _step(3, action="submit", raw=None, kind="none"),
     ]
-    handler = RecordingHandler(cfg, consent_broker=broker, capture_factory=_capture_factory(steps))
+    handler = RecordingHandler(
+        cfg,
+        consent_broker=broker,
+        capture_factory=_capture_factory(steps),
+        recording_cipher=_TEST_CIPHER,
+    )
 
     start = StartRecordingMessage(
         id=new_id(),
@@ -703,7 +942,10 @@ async def test_mock_capture_source_end_to_end(tmp_path: Path) -> None:
 async def test_stop_unknown_recording_returns_not_found(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     handler = RecordingHandler(
-        cfg, consent_broker=ConsentBroker(), capture_factory=_capture_factory([])
+        cfg,
+        consent_broker=ConsentBroker(),
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
     )
     stop = StopRecordingMessage(
         id=new_id(), ts=now_ts(), payload=StopRecordingPayload(recording_id="rec_nope")
@@ -716,7 +958,10 @@ async def test_stop_unknown_recording_returns_not_found(tmp_path: Path) -> None:
 async def test_fetch_unknown_recording_returns_not_found(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     handler = RecordingHandler(
-        cfg, consent_broker=ConsentBroker(), capture_factory=_capture_factory([])
+        cfg,
+        consent_broker=ConsentBroker(),
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
     )
     fetch = RecordingFetchMessage(
         id=new_id(), ts=now_ts(), payload=RecordingFetchPayload(recording_id="rec_nope")

@@ -209,7 +209,9 @@ class WindowsBackend(ComputerUseBackend):
         try:
             import ctypes
 
-            ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 0x02)
+            ctypes.windll.user32.PrintWindow(  # type: ignore[attr-defined]
+                hwnd, save_dc.GetSafeHdc(), 0x02
+            )
         except Exception as exc:
             raise FeatureNotSupportedError(
                 "screenshot.window", reason=f"PrintWindow failed: {exc}"
@@ -651,7 +653,9 @@ class WindowsBackend(ComputerUseBackend):
         try:
             import ctypes
 
-            return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+            return int(
+                ctypes.windll.user32.GetClipboardSequenceNumber()  # type: ignore[attr-defined]
+            )
         except Exception:
             return None
 
@@ -717,7 +721,7 @@ class WindowsBackend(ComputerUseBackend):
         try:
             import ctypes
 
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
         except Exception:
             return False
 

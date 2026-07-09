@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from enum import Enum
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -98,7 +98,7 @@ class ProtocolVersionMismatch(Exception):
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
-class MessageType(str, Enum):
+class MessageType(StrEnum):
     HELLO = "HELLO"
     HELLO_ACK = "HELLO_ACK"
     EXECUTE_COMMAND = "EXECUTE_COMMAND"
@@ -143,18 +143,22 @@ class MessageType(str, Enum):
     LOCAL_LLM_COMPLETION_CHUNK = "LOCAL_LLM_COMPLETION_CHUNK"
     LOCAL_LLM_COMPLETION_RESPONSE = "LOCAL_LLM_COMPLETION_RESPONSE"
     # Workflow recording (see docs/WORKFLOW_RECORDING.md §6).
+    REQUEST_RECORDING_CONSENT = "REQUEST_RECORDING_CONSENT"
+    RECORDING_CONSENT_RESULT = "RECORDING_CONSENT_RESULT"
     START_RECORDING = "START_RECORDING"
     RECORDING_STARTED = "RECORDING_STARTED"
     STOP_RECORDING = "STOP_RECORDING"
     RECORDING_SUMMARY = "RECORDING_SUMMARY"
     RECORDING_FETCH = "RECORDING_FETCH"
     RECORDING_DATA = "RECORDING_DATA"
+    APPLY_RECORDING_REVIEW = "APPLY_RECORDING_REVIEW"
+    RECORDING_REVIEW_APPLIED = "RECORDING_REVIEW_APPLIED"
     # Unsolicited co-pilot-mode step stream — modeled like STATUS: not acked,
     # not counted against in-flight / max_concurrent, never auto-retried.
     RECORDING_STEP = "RECORDING_STEP"
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     PATH_OUTSIDE_ALLOWED_ROOT = "PATH_OUTSIDE_ALLOWED_ROOT"
     PATH_RESERVED_NAME = "PATH_RESERVED_NAME"
     PATH_INVALID_CHARS = "PATH_INVALID_CHARS"
@@ -184,6 +188,7 @@ class ErrorCode(str, Enum):
     RECORDING_NOT_FOUND = "RECORDING_NOT_FOUND"
     RECORDING_CHANNEL_UNAVAILABLE = "RECORDING_CHANNEL_UNAVAILABLE"
     RECORDING_ALREADY_ACTIVE = "RECORDING_ALREADY_ACTIVE"
+    RECORDING_REVIEW_INVALID = "RECORDING_REVIEW_INVALID"
     # START_RECORDING arrived without a valid shim-issued consent token.
     CONSENT_REQUIRED = "CONSENT_REQUIRED"
     # The requested interpretation_route needs a local model the machine
@@ -191,19 +196,19 @@ class ErrorCode(str, Enum):
     INTERPRETATION_UNAVAILABLE = "INTERPRETATION_UNAVAILABLE"
 
 
-class Platform(str, Enum):
+class Platform(StrEnum):
     DARWIN = "darwin"
     LINUX = "linux"
     WINDOWS = "windows"
     WSL2 = "wsl2"
 
 
-class Arch(str, Enum):
+class Arch(StrEnum):
     X86_64 = "x86_64"
     ARM64 = "arm64"
 
 
-class Shell(str, Enum):
+class Shell(StrEnum):
     AUTO = "auto"
     BASH = "bash"
     SH = "sh"
@@ -213,12 +218,12 @@ class Shell(str, Enum):
     CMD = "cmd"
 
 
-class Encoding(str, Enum):
+class Encoding(StrEnum):
     UTF8 = "utf-8"
     BASE64 = "base64"
 
 
-class FileFormat(str, Enum):
+class FileFormat(StrEnum):
     TEXT = "text"
     BYTES = "bytes"
 
@@ -826,6 +831,26 @@ class EnrichmentCoverage(BaseModel):
     none: int = 0
 
 
+class RequestRecordingConsentPayload(_Payload):
+    """platform → shim. Asks the shim to render its local consent prompt."""
+
+    mode: RecordingMode
+    interpretation_route: InterpretationRoute = "extract_then_cloud"
+    channels: list[RecordingChannel] = Field(
+        default_factory=lambda: ["floor"]  # type: ignore[arg-type]
+    )
+
+
+class RecordingConsentResultPayload(_Payload):
+    """shim → platform. The token exists only after local approval."""
+
+    approved: bool
+    mode: RecordingMode
+    interpretation_route: InterpretationRoute
+    consent_token: str | None = None
+    expires_at: float | None = None
+
+
 class StartRecordingPayload(_Payload):
     """platform → shim. `consent_token` is REQUIRED and must be a valid
     shim-issued token — the platform cannot self-assert consent (§9). A START
@@ -862,6 +887,19 @@ class RecordingDataPayload(_Payload):
     """The full WorkflowRecording, post-redaction (§6)."""
 
     recording: WorkflowRecording
+
+
+class ApplyRecordingReviewPayload(_Payload):
+    """User-approved removals and redactions applied to the shim-side copy."""
+
+    recording_id: str
+    removed_step_seqs: list[int] = Field(default_factory=list)
+    redacted_step_seqs: list[int] = Field(default_factory=list)
+
+
+class RecordingReviewAppliedPayload(_Payload):
+    recording_id: str
+    step_count: int
 
 
 class RecordingStepPayload(_Payload):
@@ -1105,6 +1143,16 @@ class LocalLLMCompletionResponseMessage(_Envelope):
     payload: LocalLLMCompletionResponsePayload
 
 
+class RequestRecordingConsentMessage(_Envelope):
+    type: Literal[MessageType.REQUEST_RECORDING_CONSENT] = MessageType.REQUEST_RECORDING_CONSENT
+    payload: RequestRecordingConsentPayload
+
+
+class RecordingConsentResultMessage(_Envelope):
+    type: Literal[MessageType.RECORDING_CONSENT_RESULT] = MessageType.RECORDING_CONSENT_RESULT
+    payload: RecordingConsentResultPayload
+
+
 class StartRecordingMessage(_Envelope):
     type: Literal[MessageType.START_RECORDING] = MessageType.START_RECORDING
     payload: StartRecordingPayload
@@ -1133,6 +1181,16 @@ class RecordingFetchMessage(_Envelope):
 class RecordingDataMessage(_Envelope):
     type: Literal[MessageType.RECORDING_DATA] = MessageType.RECORDING_DATA
     payload: RecordingDataPayload
+
+
+class ApplyRecordingReviewMessage(_Envelope):
+    type: Literal[MessageType.APPLY_RECORDING_REVIEW] = MessageType.APPLY_RECORDING_REVIEW
+    payload: ApplyRecordingReviewPayload
+
+
+class RecordingReviewAppliedMessage(_Envelope):
+    type: Literal[MessageType.RECORDING_REVIEW_APPLIED] = MessageType.RECORDING_REVIEW_APPLIED
+    payload: RecordingReviewAppliedPayload
 
 
 class RecordingStepMessage(_Envelope):
@@ -1185,12 +1243,16 @@ Message = Annotated[
     | LocalLLMCompletionMessage
     | LocalLLMCompletionChunkMessage
     | LocalLLMCompletionResponseMessage
+    | RequestRecordingConsentMessage
+    | RecordingConsentResultMessage
     | StartRecordingMessage
     | RecordingStartedMessage
     | StopRecordingMessage
     | RecordingSummaryMessage
     | RecordingFetchMessage
     | RecordingDataMessage
+    | ApplyRecordingReviewMessage
+    | RecordingReviewAppliedMessage
     | RecordingStepMessage,
     Field(discriminator="type"),
 ]
@@ -1256,6 +1318,8 @@ __all__ = [
     "Arch",
     "AckMessage",
     "AckPayload",
+    "ApplyRecordingReviewMessage",
+    "ApplyRecordingReviewPayload",
     "AppInfo",
     "AppLaunchMessage",
     "AppLaunchPayload",
@@ -1335,13 +1399,19 @@ __all__ = [
     "Platform",
     "PongMessage",
     "RecordingChannel",
+    "RecordingConsentResultMessage",
+    "RecordingConsentResultPayload",
     "RecordingDataMessage",
     "RecordingDataPayload",
     "RecordingFetchMessage",
     "RecordingFetchPayload",
     "RecordingMode",
+    "RequestRecordingConsentMessage",
+    "RequestRecordingConsentPayload",
     "RecordingStartedMessage",
     "RecordingStartedPayload",
+    "RecordingReviewAppliedMessage",
+    "RecordingReviewAppliedPayload",
     "RecordingStepMessage",
     "RecordingStepPayload",
     "RecordingSummaryMessage",

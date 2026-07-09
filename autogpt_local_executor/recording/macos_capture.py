@@ -103,9 +103,7 @@ class MacInputCaptureSource(CaptureSource):
 
         self._runloop = Quartz.CFRunLoopGetCurrent()
         source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
-        Quartz.CFRunLoopAddSource(
-            self._runloop, source, Quartz.kCFRunLoopCommonModes
-        )
+        Quartz.CFRunLoopAddSource(self._runloop, source, Quartz.kCFRunLoopCommonModes)
         Quartz.CGEventTapEnable(self._tap, True)
         Quartz.CFRunLoopRun()  # blocks until CFRunLoopStop
 
@@ -162,14 +160,11 @@ class MacInputCaptureSource(CaptureSource):
             import Quartz
 
             info = Quartz.CGWindowListCopyWindowInfo(
-                Quartz.kCGWindowListOptionOnScreenOnly
-                | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
                 Quartz.kCGNullWindowID,
             )
             for w in info or []:
-                if w.get("kCGWindowOwnerName") == app_name and w.get(
-                    "kCGWindowLayer", 1
-                ) == 0:
+                if w.get("kCGWindowOwnerName") == app_name and w.get("kCGWindowLayer", 1) == 0:
                     return str(w.get("kCGWindowName", "") or "")
         except Exception:
             pass

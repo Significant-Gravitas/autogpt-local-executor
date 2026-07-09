@@ -115,7 +115,7 @@ def test_blocks_windows_reserved_name(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(sys.platform != "win32", reason="UNC prefix only on Windows")
 def test_blocks_unc_long_path_escape(tmp_path: Path) -> None:
-    """\\?\<drive>\..\..\etc should still fail the prefix check."""
+    r"""\\?\<drive>\..\..\etc should still fail the prefix check."""
     bad = f"\\\\?\\{tmp_path}\\..\\..\\Windows\\System32\\cmd.exe"
     with pytest.raises(PathJailError):
         assert_inside_jail(bad, tmp_path)

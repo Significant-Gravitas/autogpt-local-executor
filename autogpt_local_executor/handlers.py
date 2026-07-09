@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from . import platform_info
 from .audit import AuditWriter
@@ -42,6 +42,7 @@ from .protocol import (
     AppListRequestMessage,
     AppListResponseMessage,
     AppListResponsePayload,
+    ApplyRecordingReviewMessage,
     ClipboardReadMessage,
     ClipboardReadResponseMessage,
     ClipboardReadResponsePayload,
@@ -83,15 +84,20 @@ from .protocol import (
     PermissionsCheckRequestMessage,
     PermissionsCheckResponseMessage,
     PermissionsCheckResponsePayload,
+    RecordingConsentResultMessage,
+    RecordingConsentResultPayload,
     RecordingDataMessage,
     RecordingDataPayload,
     RecordingFetchMessage,
+    RecordingReviewAppliedMessage,
+    RecordingReviewAppliedPayload,
     RecordingStartedMessage,
     RecordingStartedPayload,
     RecordingStepMessage,
     RecordingStepPayload,
     RecordingSummaryMessage,
     RecordingSummaryPayload,
+    RequestRecordingConsentMessage,
     ScreenshotRequestMessage,
     ScreenshotResponseMessage,
     ScreenshotResponseMeta,
@@ -112,16 +118,20 @@ from .recording import (
     CaptureSource,
     ConsentBroker,
     ConsentError,
+    RecordingError,
     RecordingSession,
     ScreenshotActionFloor,
     probe_interpretation_route,
+    request_user_consent,
 )
+from .recording.consent import CONSENT_TOKEN_TTL_SECONDS
+from .recording.crypto import RecordingCipher
 
 # Kept for legacy tests that monkeypatch h_mod._pyautogui / h_mod._Image.
 try:
     import pyautogui as _pyautogui  # type: ignore[import-untyped]
     from PIL import Image as _Image  # type: ignore[import-untyped]
-except ImportError:
+except Exception:
     _pyautogui = None  # type: ignore[assignment]
     _Image = None  # type: ignore[assignment]
 
@@ -591,7 +601,21 @@ class FileHandler:
         if payload.create_parents:
             await asyncio.to_thread(lambda: path.parent.mkdir(parents=True, exist_ok=True))
 
-        await asyncio.to_thread(path.write_bytes, raw)
+        try:
+            await asyncio.to_thread(path.write_bytes, raw)
+        except OSError as exc:
+            code = (
+                ErrorCode.PATH_NOT_FOUND
+                if isinstance(exc, FileNotFoundError)
+                else ErrorCode.INTERNAL_ERROR
+            )
+            await self._emit(
+                "FILE_WRITE",
+                msg.id,
+                {**details_base, "size_bytes_written": 0},
+                _err_result(_elapsed_ms(start), code.value),
+            )
+            return make_error(msg.id, code, f"Could not write file: {exc}")
         await self._emit(
             "FILE_WRITE",
             msg.id,
@@ -1149,7 +1173,7 @@ class ComputerUseHandler:
                 direction=p.direction,
                 clicks=p.clicks,
                 button=p.button,
-                modifiers=p.modifiers,
+                modifiers=cast(list[str] | None, p.modifiers),
                 scroll_amount=p.scroll_amount,
                 scroll_direction=p.scroll_direction,
                 duration_ms=p.duration_ms,
@@ -1375,7 +1399,7 @@ class ComputerUseHandler:
             id=msg.id,
             ts=now_ts(),
             payload=ClipboardReadResponsePayload(
-                format=result.format,
+                format=cast(Literal["text", "image"], result.format),
                 content=result.content,
                 size_bytes=result.size_bytes,
             ),
@@ -1425,7 +1449,12 @@ class ComputerUseHandler:
         return PermissionsCheckResponseMessage(
             id=msg.id,
             ts=now_ts(),
-            payload=PermissionsCheckResponsePayload(permissions=perms),
+            payload=PermissionsCheckResponsePayload(
+                permissions=cast(
+                    dict[str, Literal["granted", "denied", "unknown", "not_applicable"]],
+                    perms,
+                )
+            ),
         )
 
 
@@ -1856,6 +1885,8 @@ class RecordingHandler:
         *,
         consent_broker: ConsentBroker | None = None,
         capture_factory: Any | None = None,
+        recording_cipher: RecordingCipher | None = None,
+        consent_prompt: Any | None = None,
     ) -> None:
         self.config = config
         self.audit = audit
@@ -1864,6 +1895,8 @@ class RecordingHandler:
         # (+ a11y enricher) wrapping the computer-use backend. Tests inject a
         # scripted MockCaptureSource here.
         self._capture_factory = capture_factory or self._default_capture_factory
+        self._recording_cipher = recording_cipher
+        self._consent_prompt = consent_prompt or request_user_consent
         self._session: RecordingSession | None = None
         # The background task draining the CaptureSource (co-pilot streaming or
         # demonstration buffering).
@@ -1897,16 +1930,46 @@ class RecordingHandler:
                 ErrorCode.CAPABILITY_NOT_GRANTED,
                 "Workflow recording is not enabled on this shim.",
             )
+        if isinstance(msg, RequestRecordingConsentMessage):
+            return await self._request_consent(msg)
         if isinstance(msg, StartRecordingMessage):
             return await self._start(msg, send=send)
         if isinstance(msg, StopRecordingMessage):
             return await self._stop(msg)
+        if isinstance(msg, ApplyRecordingReviewMessage):
+            return await self._apply_review(msg)
         if isinstance(msg, RecordingFetchMessage):
             return await self._fetch(msg)
         return make_error(
             msg.id,
             ErrorCode.INTERNAL_ERROR,
             f"Unknown recording message: {type(msg).__name__}",
+        )
+
+    async def _request_consent(self, msg: RequestRecordingConsentMessage) -> Any:
+        p = msg.payload
+        decision = probe_interpretation_route(
+            channels=p.channels,
+            local_llm_models=list(self._advertised_models()),
+            requested=p.interpretation_route,
+        )
+        token = await asyncio.to_thread(
+            self._consent_prompt,
+            self.consent,
+            mode=p.mode,
+            interpretation_route=decision.route,
+        )
+        approved = bool(token)
+        return RecordingConsentResultMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=RecordingConsentResultPayload(
+                approved=approved,
+                mode=p.mode,
+                interpretation_route=decision.route,
+                consent_token=token if approved else None,
+                expires_at=(time.time() + CONSENT_TOKEN_TTL_SECONDS if approved else None),
+            ),
         )
 
     # ── START ─────────────────────────────────────────────────────────────
@@ -1926,7 +1989,11 @@ class RecordingHandler:
         # Consent: the token must be a valid, shim-issued, single-use token.
         # A platform that self-asserts (no/forged token) gets CONSENT_REQUIRED.
         try:
-            self.consent.validate_consent_token(p.consent_token, mode=p.mode)
+            self.consent.validate_consent_token(
+                p.consent_token,
+                mode=p.mode,
+                interpretation_route=p.interpretation_route,
+            )
         except ConsentError as exc:
             return make_error(
                 msg.id,
@@ -1949,6 +2016,7 @@ class RecordingHandler:
             interpretation_route=decision.route,
             channels=list(p.channels),
             buffer_dir=self.config.derived_recording_buffer_dir,
+            cipher=self._recording_cipher,
         )
         session.start()
         self._session = session
@@ -2062,6 +2130,31 @@ class RecordingHandler:
         )
 
     # ── FETCH ─────────────────────────────────────────────────────────────
+
+    async def _apply_review(self, msg: ApplyRecordingReviewMessage) -> Any:
+        session = self._session
+        if session is None or session.recording_id != msg.payload.recording_id:
+            return make_error(
+                msg.id,
+                ErrorCode.RECORDING_NOT_FOUND,
+                f"No recording with id {msg.payload.recording_id!r}.",
+            )
+        try:
+            step_count = session.apply_review(
+                removed_step_seqs=msg.payload.removed_step_seqs,
+                redacted_step_seqs=msg.payload.redacted_step_seqs,
+            )
+        except RecordingError as exc:
+            return make_error(msg.id, ErrorCode.RECORDING_REVIEW_INVALID, str(exc))
+        await self._audit_lifecycle("RECORDING_REVIEW_APPLIED", session)
+        return RecordingReviewAppliedMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=RecordingReviewAppliedPayload(
+                recording_id=session.recording_id,
+                step_count=step_count,
+            ),
+        )
 
     async def _fetch(self, msg: RecordingFetchMessage) -> Any:
         session = self._session

@@ -1,8 +1,8 @@
 """
 Consent tokens — shim-enforced, not platform-asserted (§9).
 
-`START_RECORDING` carries a `consent_token` the shim issues *only* after an
-OS-native, shim-rendered confirmation the platform cannot script. A platform
+`REQUEST_RECORDING_CONSENT` asks the shim to show a local confirmation. Only an
+affirmative response mints the token required by `START_RECORDING`; a platform
 that sends START without a valid token gets CONSENT_REQUIRED.
 
 Design (per docs/WORKFLOW_RECORDING.md §9):
@@ -12,10 +12,8 @@ Design (per docs/WORKFLOW_RECORDING.md §9):
   has no access to the shim-local HMAC key and never sees the issuance path.
 - `validate_consent_token` checks the signature, expiry, and single-use status.
   A token is consumed on the first successful START so it can't be replayed.
-- `request_user_consent()` is the seam for the real OS-native dialog. For now
-  it is a stub that issues a token directly (see the TODO). The real
-  implementation MUST show a tray/menu-bar dialog the platform-controlled UI
-  cannot drive, gather an affirmative click, and only then mint.
+- `request_user_consent()` renders the confirmation in the shim process, not
+  the platform-controlled browser, and only mints after an affirmative click.
 
 The token is intentionally opaque to the platform: it round-trips it verbatim.
 """
@@ -166,22 +164,35 @@ def request_user_consent(
     *,
     mode: str,
     interpretation_route: str,
-) -> str:
+) -> str | None:
     """Show the OS-native confirmation and return a fresh consent token.
 
-    THIS IS A STUB. It currently issues a token unconditionally, which is fine
-    for tests + dev where there is no display.
-
-    TODO(os-native): replace the body with a real shim-rendered dialog —
-      * tray/menu-bar prompt the platform-controlled copilot UI cannot drive
-        (§9: "the visible recording indicator is shim-rendered");
-      * for `screenshots_to_cloud`, the calibrated §9.1 copy and the
-        "Keep it on my machine" / "Send and build" choice;
-      * only on an affirmative click do we call `issue_consent_token`.
-    The wire contract does not change — only this function's body does.
+    Returns ``None`` when the prompt is declined or cannot be rendered. A
+    headless shim therefore fails closed instead of silently authorizing a
+    recording.
     """
-    # The real dialog would block on user input here. The token is still
-    # minted shim-side, so the consent gate's trust boundary is unchanged.
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        if interpretation_route == "screenshots_to_cloud":
+            detail = "Screenshots may be sent to AutoGPT to build the workflow."
+        else:
+            detail = "Screenshots stay on this machine; extracted steps may be processed."
+        approved = messagebox.askyesno(
+            "Allow AutoGPT workflow recording?",
+            f"AutoGPT wants to start a {mode} recording.\n\n{detail}",
+            parent=root,
+        )
+        root.destroy()
+    except Exception:
+        logger.warning("Could not render the local recording-consent prompt", exc_info=True)
+        return None
+    if not approved:
+        return None
     return broker.issue_consent_token(mode=mode, interpretation_route=interpretation_route)
 
 

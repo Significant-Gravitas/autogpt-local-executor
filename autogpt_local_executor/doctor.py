@@ -306,7 +306,7 @@ def _check_windows(config: ShimConfig) -> list[CheckResult]:
     try:
         import ctypes
 
-        elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
     except Exception:
         elevated = False
     if elevated:

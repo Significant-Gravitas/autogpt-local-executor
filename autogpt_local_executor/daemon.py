@@ -39,6 +39,8 @@ from .protocol import (
 from .protocol import (
     AppLaunchMessage,
     AppListRequestMessage,
+    ApplyRecordingReviewMessage,
+    Arch,
     ClipboardReadMessage,
     ClipboardWriteMessage,
     CursorPositionRequestMessage,
@@ -58,8 +60,10 @@ from .protocol import (
     LocalLLMCompletionMessage,
     PermissionsCheckRequestMessage,
     PingMessage,
+    Platform,
     ProtocolVersionMismatch,
     RecordingFetchMessage,
+    RequestRecordingConsentMessage,
     ScreenshotRequestMessage,
     SessionRevokedMessage,
     StartRecordingMessage,
@@ -501,8 +505,8 @@ class ShimDaemon:
         payload = HelloPayload(
             shim_version=__import__("autogpt_local_executor").__version__,
             machine_id=cfg.machine_id,
-            platform=platform_info.detect_platform(),
-            arch=platform_info.detect_arch(),
+            platform=Platform(platform_info.detect_platform()),
+            arch=Arch(platform_info.detect_arch()),
             screen_resolution=screen,
             capabilities=caps,
             allowed_root=str(cfg.allowed_root),
@@ -736,7 +740,7 @@ class ShimDaemon:
         # throttle issuance before we trip SHIM_OVERLOADED. Compute AFTER
         # decrementing _in_flight so the number reflects post-response slots.
         try:
-            response.pending_capacity = self._available_capacity()
+            setattr(response, "pending_capacity", self._available_capacity())
         except Exception:
             # _Envelope subclasses all carry the field via the base; this
             # is just paranoia for any future hand-rolled response model.
@@ -790,7 +794,16 @@ class ShimDaemon:
             return await self._computer_handler.handle(msg)
         if isinstance(msg, LocalLLMCompletionMessage):
             return await self._local_llm_handler.handle(msg, send=send)
-        if isinstance(msg, (StartRecordingMessage, StopRecordingMessage, RecordingFetchMessage)):
+        if isinstance(
+            msg,
+            (
+                RequestRecordingConsentMessage,
+                StartRecordingMessage,
+                StopRecordingMessage,
+                ApplyRecordingReviewMessage,
+                RecordingFetchMessage,
+            ),
+        ):
             # START/STOP/FETCH are request/response ops that count against
             # in-flight (§6). The `send` callback lets START stream unsolicited
             # RECORDING_STEP frames in co-pilot mode (exempt from accounting,

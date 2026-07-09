@@ -60,6 +60,11 @@ def test_derived_oauth_url_from_wss() -> None:
     assert cfg.derived_oauth_url == "https://platform.example.com/auth"
 
 
+def test_derived_oauth_token_url_from_wss() -> None:
+    cfg = ShimConfig(platform_url="wss://platform.example.com")
+    assert cfg.derived_oauth_token_url == "https://platform.example.com/api/oauth/token"
+
+
 def test_explicit_overrides_take_priority() -> None:
     cfg = ShimConfig(
         platform_url="https://x",

@@ -1,6 +1,6 @@
 # OAuth Flow — Shim Authentication
 
-> **Status**: Spec / Not Implemented
+> **Status**: Implemented
 
 The shim authenticates using AutoGPT's **existing OAuth 2.0 provider infrastructure** —
 the same system used by third-party app integrations. No new auth infrastructure needed.
@@ -9,7 +9,7 @@ the same system used by third-party app integrations. No new auth infrastructure
 
 AutoGPT already runs a full OAuth 2.0 Authorization Server:
 - `/auth/authorize` — authorization endpoint
-- `/auth/token` — token endpoint  
+- `/api/oauth/token` — token endpoint
 - `introspect_token()` — token validation
 - Authorization Code + PKCE flow already implemented
 
@@ -20,20 +20,14 @@ Authorization Code + PKCE with a localhost redirect URI.
 
 ## Registration (One-Time)
 
-The shim is a first-party OAuth application registered in the AutoGPT
-platform. **v0 uses a confidential client + PKCE flow** (not pure-public
-PKCE). Rationale: the platform's existing OAuth schema requires a
-`clientSecret` on every grant, and true public-client support is a
-follow-up schema change. PKCE still provides session security; the
-embedded secret is published with the shim source.
+The shim is a first-party public OAuth application registered in the AutoGPT
+platform. It uses Authorization Code + PKCE and has no client secret.
 
 ```
 Client ID:     autogpt-local-executor (well-known)
-Client Secret: published with the shim distribution (PKCE provides
-               session security; treat the secret as public)
+Client type:   public (PKCE; no client secret)
 Redirect URI:  http://localhost:{port}/callback   where {port} ∈ 41899..41910
-Scopes:        local_executor:connect local_executor:shell local_executor:files
-               (optional) local_executor:computer_use local_executor:hardware
+Scopes:        USE_TOOLS
 Grant types:   authorization_code, refresh_token
 ```
 
@@ -54,6 +48,8 @@ Each platform deployment registers the app once via the existing
 ```bash
 poetry run oauth-tool generate-app \
     --name "AutoGPT Local Executor" \
+    --client-id "autogpt-local-executor" \
+    --public \
     --description "Local PC shim for the AutoGPT hosted platform" \
     --redirect-uris \
       "http://localhost:41899/callback,http://localhost:41900/callback,\
@@ -62,17 +58,13 @@ http://localhost:41903/callback,http://localhost:41904/callback,\
 http://localhost:41905/callback,http://localhost:41906/callback,\
 http://localhost:41907/callback,http://localhost:41908/callback,\
 http://localhost:41909/callback,http://localhost:41910/callback" \
-    --scopes "EXECUTE_GRAPH"
+    --scopes "USE_TOOLS"
 ```
 
-The tool prints a generated `client_id` (format `agpt_client_<token>`)
-and `client_secret`. Until `oauth-tool` learns a `--client-id` flag,
-the "well-known `autogpt-local-executor`" id is aspirational — each
-platform deployment will have its own random client_id. The shim's
-distribution config (`AUTOGPT_LOCAL_EXECUTOR_CLIENT_ID` +
-`_CLIENT_SECRET`) is baked at build time from the operator's chosen
-deployment. End-users installing the official shim get the canonical
-agpt.co client_id; self-hosters bake in their own.
+The command prints SQL containing the well-known public client ID and an
+`isPublic=true` marker. Replace `YOUR_USER_ID_HERE`, execute it once per
+environment, and keep every callback URI in the registration. Self-hosters
+that choose another ID configure it with `AUTOGPT_SHIM_OAUTH_CLIENT_ID`.
 
 ### True public-client support (implemented)
 
@@ -89,16 +81,14 @@ SPA clients (PKCE, no client_secret).
   challenge/verifier check still happens in `consume_authorization_code`
   (which compares the verifier against the stored code_challenge).
 
-To migrate a confidential client to public after the migration runs,
-operators flip the column: `UPDATE "OAuthApplication" SET "isPublic" =
-true WHERE "clientId" = '<id>'`. The shim distribution can then drop
-its embedded "open secret" and rely entirely on PKCE; the `client_secret`
-field on the request becomes ignored for that app.
+The `oauth-tool generate-app --public` command sets this field for new shim
+registrations. Existing registrations can be migrated with `UPDATE
+"OAuthApplication" SET "isPublic" = true WHERE "clientId" = '<id>'`.
 
-Introspect (`/auth/introspect`) and revoke (`/auth/revoke`) endpoints
+Introspect (`/api/oauth/introspect`) and revoke (`/api/oauth/revoke`) endpoints
 remain confidential-auth-only — public clients shouldn't be calling
 these. The shim never hits them; it gets revocation pushed to it via
-the platform's REVOKE frame (see `PROTOCOL.md`).
+the platform's `SESSION_REVOKED` frame (see `PROTOCOL.md`).
 
 ---
 
@@ -119,7 +109,7 @@ User                    Shim                         AutoGPT Platform
  |                       |      client_id=autogpt-local-executor
  |                       |      redirect_uri=http://localhost:41899/callback
  |                       |      code_challenge=...        |
- |                       |      scope=local_executor:connect ...
+ |                       |      scope=USE_TOOLS
  |                       |                                |
  |     [Browser opens]   |                                |
  |<====================================================-->|
@@ -127,7 +117,7 @@ User                    Shim                         AutoGPT Platform
  |                       |                                |
  |                       |<-- GET /callback?code=AUTH_CODE
  |                       |                                |
- |                       | 4. POST /auth/token            |
+ |                       | 4. POST /api/oauth/token        |
  |                       |      grant_type=authorization_code
  |                       |      code=AUTH_CODE            |
  |                       |      code_verifier=...         |
@@ -154,16 +144,15 @@ Authorization: Bearer {access_token}
 Platform validates via `introspect_token(access_token)`:
 - Checks token not expired
 - Checks token belongs to the session owner
-- Checks `local_executor:connect` scope present
+- Checks `USE_TOOLS` scope present
 - Returns user_id for the session
 
 ---
 
 ## Token Refresh
 
-The shim manages token refresh proactively:
-- Refresh 5 minutes before expiry using stored `refresh_token`
-- On 401 during WebSocket upgrade, refresh and retry once
+The shim refreshes using the stored `refresh_token` when a WebSocket upgrade
+returns 401, then retries the connection once.
 - On refresh failure (expired refresh token), prompt user to re-auth via CLI: `autogpt-shim auth`
 
 Tokens stored in OS keychain:
@@ -173,16 +162,10 @@ Tokens stored in OS keychain:
 
 ---
 
-## Per-Capability Scopes
+## Scope
 
-| Capability | Required Scope |
-|-----------|----------------|
-| Shell execution | `local_executor:shell` |
-| File read/write | `local_executor:files` |
-| Computer use | `local_executor:computer_use` |
-| Hardware access | `local_executor:hardware` |
-| Local LLM | `local_executor:local_llm` |
-| Background tasks | `local_executor:background` |
-
-The platform only grants scopes the user explicitly approved during OAuth.
-The shim only advertises capabilities it has scopes for.
+The public shim client requests `USE_TOOLS`, an existing AutoGPT
+`APIKeyPermission`. The WebSocket handshake requires that scope in addition to
+an active access token and session ownership. Individual executor capabilities
+remain opt-in through shim configuration, HELLO capability advertisement,
+platform feature flags, and the per-session computer-use consent gate.

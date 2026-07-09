@@ -210,6 +210,16 @@ class ShimConfig(BaseSettings):
             base = "http://" + base[len("ws://") :]
         return base + "/auth"
 
+    @property
+    def derived_oauth_token_url(self) -> str:
+        """Backend OAuth token endpoint for code exchange and refresh."""
+        base = self.platform_url.rstrip("/")
+        if base.startswith("wss://"):
+            base = "https://" + base[len("wss://") :]
+        elif base.startswith("ws://"):
+            base = "http://" + base[len("ws://") :]
+        return base + "/api/oauth/token"
+
 
 def load_config(
     config_path: Path | None = None,

@@ -81,11 +81,7 @@ class OAuthFlow:
     Runs the Authorization Code + PKCE flow against the AutoGPT OAuth provider.
     """
 
-    SCOPES = [
-        "local_executor:connect",
-        "local_executor:shell",
-        "local_executor:files",
-    ]
+    SCOPES = ["USE_TOOLS"]
 
     def __init__(self, config, token_store: KeychainTokenStore) -> None:
         self.config = config
@@ -94,14 +90,22 @@ class OAuthFlow:
     def run(self) -> None:
         """Execute the full auth flow interactively."""
         code_verifier, code_challenge = self._generate_pkce_pair()
-        auth_url = self._build_auth_url(code_challenge)
+        state = secrets.token_urlsafe(32)
+        server, auth_code, oauth_error, callback_port = self._bind_callback_server(
+            expected_state=state
+        )
+        auth_url = self._build_auth_url(
+            code_challenge,
+            state=state,
+            redirect_port=callback_port,
+        )
 
         print("\nOpening browser for AutoGPT authentication...")
         print(f"If it doesn't open automatically, visit:\n  {auth_url}\n")
         webbrowser.open(auth_url)
 
-        auth_code = self._wait_for_callback()
-        tokens = asyncio.run(self._exchange_code(auth_code, code_verifier))
+        code = self._wait_for_callback(server, auth_code, oauth_error)
+        tokens = asyncio.run(self._exchange_code(code, code_verifier, redirect_port=callback_port))
         asyncio.run(self.token_store.store_tokens(tokens["access_token"], tokens["refresh_token"]))
         print("Authentication successful. Tokens stored in OS keychain.")
 
@@ -112,7 +116,7 @@ class OAuthFlow:
             raise ValueError("No refresh token stored. Run `autogpt-shim auth` first.")
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self.config.derived_oauth_url}/token",
+                self.config.derived_oauth_token_url,
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh,
@@ -133,50 +137,98 @@ class OAuthFlow:
         code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
         return code_verifier, code_challenge
 
-    def _build_auth_url(self, code_challenge: str) -> str:
+    def _build_auth_url(
+        self,
+        code_challenge: str,
+        *,
+        state: str | None = None,
+        redirect_port: int | None = None,
+    ) -> str:
+        port = redirect_port or self.config.oauth_redirect_port
         params = {
             "response_type": "code",
             "client_id": self.config.oauth_client_id,
-            "redirect_uri": f"http://localhost:{self.config.oauth_redirect_port}/callback",
+            "redirect_uri": f"http://localhost:{port}/callback",
             "scope": " ".join(self.SCOPES),
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
-            "state": secrets.token_urlsafe(16),
+            "state": state or secrets.token_urlsafe(32),
         }
         return f"{self.config.derived_oauth_url}/authorize?" + urllib.parse.urlencode(params)
 
-    def _wait_for_callback(self) -> str:
+    def _bind_callback_server(
+        self, *, expected_state: str
+    ) -> tuple[HTTPServer, list[str], list[str], int]:
         auth_code: list[str] = []
+        oauth_error: list[str] = []
 
         class CallbackHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 parsed = urllib.parse.urlparse(self.path)
                 params = urllib.parse.parse_qs(parsed.query)
-                if "code" in params:
+                state = params.get("state", [""])[0]
+                if parsed.path != "/callback":
+                    self.send_response(404)
+                    message = b"Not found"
+                elif not secrets.compare_digest(state, expected_state):
+                    oauth_error.append("OAuth callback state did not match")
+                    self.send_response(400)
+                    message = b"Authentication failed: invalid state."
+                elif "error" in params:
+                    oauth_error.append(params["error"][0])
+                    self.send_response(400)
+                    message = b"Authentication was denied or failed."
+                elif "code" in params and params["code"][0]:
                     auth_code.append(params["code"][0])
-                self.send_response(200)
+                    self.send_response(200)
+                    message = b"<h1>Authenticated! You can close this tab.</h1>"
+                else:
+                    oauth_error.append("No authorization code received")
+                    self.send_response(400)
+                    message = b"Authentication failed: no authorization code."
                 self.end_headers()
-                self.wfile.write(b"<h1>Authenticated! You can close this tab.</h1>")
+                self.wfile.write(message)
 
             def log_message(self, *args):
                 pass
 
-        server = HTTPServer(("localhost", self.config.oauth_redirect_port), CallbackHandler)
-        server.handle_request()
-        server.server_close()
+        first_port = self.config.oauth_redirect_port
+        for port in range(first_port, first_port + 12):
+            try:
+                server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+                server.timeout = 300
+                return server, auth_code, oauth_error, port
+            except OSError:
+                continue
+        raise RuntimeError(f"Could not bind OAuth callback on ports {first_port}-{first_port + 11}")
+
+    @staticmethod
+    def _wait_for_callback(server: HTTPServer, auth_code: list[str], oauth_error: list[str]) -> str:
+        try:
+            server.handle_request()
+        finally:
+            server.server_close()
 
         if not auth_code:
-            raise ValueError("No authorization code received from OAuth callback")
+            detail = oauth_error[0] if oauth_error else "OAuth callback timed out"
+            raise ValueError(detail)
         return auth_code[0]
 
-    async def _exchange_code(self, auth_code: str, code_verifier: str) -> dict:
+    async def _exchange_code(
+        self,
+        auth_code: str,
+        code_verifier: str,
+        *,
+        redirect_port: int | None = None,
+    ) -> dict:
+        port = redirect_port or self.config.oauth_redirect_port
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self.config.derived_oauth_url}/token",
+                self.config.derived_oauth_token_url,
                 data={
                     "grant_type": "authorization_code",
                     "code": auth_code,
-                    "redirect_uri": f"http://localhost:{self.config.oauth_redirect_port}/callback",
+                    "redirect_uri": f"http://localhost:{port}/callback",
                     "client_id": self.config.oauth_client_id,
                     "code_verifier": code_verifier,
                 },

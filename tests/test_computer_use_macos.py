@@ -158,10 +158,10 @@ def test_wait_action_does_not_check_ax(tmp_path, monkeypatch) -> None:
     a sleep)."""
     b = MacOSBackend(_config(tmp_path))
     monkeypatch.setattr(b, "_ax_trusted", lambda: False)
-    start = time.monotonic()
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
     b.input_action("wait", duration_ms=20)
-    elapsed = time.monotonic() - start
-    assert elapsed >= 0.015
+    assert slept == [0.02]
 
 
 # ── Clipboard (Q3) ─────────────────────────────────────────────────────

@@ -105,6 +105,8 @@ class MacInputCaptureSource(CaptureSource):
         source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
         Quartz.CFRunLoopAddSource(self._runloop, source, Quartz.kCFRunLoopCommonModes)
         Quartz.CGEventTapEnable(self._tap, True)
+        if self._stop.is_set():
+            return
         Quartz.CFRunLoopRun()  # blocks until CFRunLoopStop
 
     def _on_event(self, proxy, etype, event, refcon):

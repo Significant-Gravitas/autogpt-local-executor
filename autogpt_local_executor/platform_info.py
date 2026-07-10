@@ -73,7 +73,7 @@ def _module_available(name: str) -> bool:
 
 def detect_capabilities(
     *,
-    enable_shell: bool = True,
+    enable_shell: bool = False,
     enable_computer_use: bool = False,
     enable_local_llm: bool = False,
     enable_hardware: bool = False,
@@ -102,12 +102,15 @@ def detect_capabilities(
             caps.append("hardware_usb")
         if _module_available("RPi.GPIO"):
             caps.append("hardware_gpio")
-    # Recording requires the universal screenshot+action floor, which wraps the
-    # same backend computer_use uses. Only advertise when the floor is
-    # available. See docs/WORKFLOW_RECORDING.md §4, §6.
-    if enable_recording and _can_do_computer_use():
-        caps.append("recording")
+    # Workflow recording remains a design preview. Its capture and
+    # interpretation pipeline isn't safe to expose end to end, so this
+    # capability is never advertised even when the preview flag is set.
     return caps
+
+
+def available_recording_channels() -> list[str]:
+    """Return no channels until recording is production-ready end to end."""
+    return []
 
 
 def _can_do_computer_use() -> bool:
@@ -335,6 +338,7 @@ def resolve_shell(shell: str) -> tuple[str, list[str]] | None:
 
 
 __all__ = [
+    "available_recording_channels",
     "default_allowed_root",
     "default_audit_log_path",
     "detect_arch",

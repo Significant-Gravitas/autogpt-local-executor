@@ -85,10 +85,12 @@ The `oauth-tool generate-app --public` command sets this field for new shim
 registrations. Existing registrations can be migrated with `UPDATE
 "OAuthApplication" SET "isPublic" = true WHERE "clientId" = '<id>'`.
 
-Introspect (`/api/oauth/introspect`) and revoke (`/api/oauth/revoke`) endpoints
-remain confidential-auth-only — public clients shouldn't be calling
-these. The shim never hits them; it gets revocation pushed to it via
-the platform's `SESSION_REVOKED` frame (see `PROTOCOL.md`).
+Introspect (`/api/oauth/introspect`) remains confidential-auth-only. Revoke
+(`/api/oauth/revoke`) accepts this registered public client without a secret,
+binds each token to the client before revoking it, and returns the RFC 7009
+non-disclosing success response. `autogpt-shim revoke` revokes the access and
+refresh tokens before clearing the keychain. The platform also pushes a
+`SESSION_REVOKED` frame to a connected shim (see `PROTOCOL.md`).
 
 ---
 
@@ -151,8 +153,12 @@ Platform validates via `introspect_token(access_token)`:
 
 ## Token Refresh
 
-The shim refreshes using the stored `refresh_token` when a WebSocket upgrade
-returns 401, then retries the connection once.
+The shim refreshes using the stored `refresh_token` exactly once when the
+initial WebSocket upgrade returns 401. An initial 403 is treated as a terminal
+session-authorization denial and never rotates credentials. If the post-refresh
+retry returns 401 or 403, startup terminates instead of entering the reconnect
+loop. The refresh is forced even while the rejected access token remains in the
+keychain.
 - On refresh failure (expired refresh token), prompt user to re-auth via CLI: `autogpt-shim auth`
 
 Tokens stored in OS keychain:

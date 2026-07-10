@@ -21,14 +21,18 @@ from typing import Any
 
 import pytest
 
+from autogpt_local_executor.audit import AuditWriter
 from autogpt_local_executor.config import ShimConfig
 from autogpt_local_executor.daemon import (
     STATUS_INTERVAL_SECONDS,
     ShimDaemon,
 )
 from autogpt_local_executor.protocol import (
+    MAX_WEBSOCKET_MESSAGE_BYTES,
     AckMessage,
     AckPayload,
+    CommandResultMessage,
+    CommandResultPayload,
     MessageType,
     StatusMessage,
     StatusPayload,
@@ -69,7 +73,8 @@ def shim_config(tmp_path: Path) -> ShimConfig:
 
 @pytest.fixture()
 def daemon(shim_config: ShimConfig) -> ShimDaemon:
-    return ShimDaemon(shim_config, token_store=None, audit=None)
+    audit = AuditWriter(path=shim_config.audit_log_path, audit_key=b"a" * 32)
+    return ShimDaemon(shim_config, token_store=object(), audit=audit)
 
 
 # ── Wire shape ───────────────────────────────────────────────────────────────
@@ -138,9 +143,8 @@ def test_build_status_message_snapshots_counters(daemon: ShimDaemon) -> None:
     assert msg.payload.in_flight == 2
     assert msg.payload.queue_depth == 1
     assert msg.payload.max_concurrent == daemon.config.max_concurrent
-    # pending_capacity is the envelope field, populated from
-    # max_concurrent - in_flight.
-    assert msg.pending_capacity == daemon.config.max_concurrent - 2
+    # Queued work consumes admission capacity too.
+    assert msg.pending_capacity == daemon.config.max_concurrent - 3
     # Uptime is positive (we set started_at 10s ago).
     assert msg.payload.uptime_seconds >= 10.0
 
@@ -253,6 +257,95 @@ async def test_dispatch_does_not_emit_status_when_not_at_edge(
     await daemon._dispatch(ws, make_ack("ignored"))
     assert len(ws.sent) == 1
     assert json.loads(ws.sent[0])["type"] == "ACK"
+
+
+async def test_on_frame_rejects_overload_without_unbounded_task_queue(
+    daemon: ShimDaemon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon.config.max_concurrent = 1
+    daemon._semaphore = asyncio.Semaphore(1)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_handle(_msg: Any, *, send: Any = None) -> AckMessage:
+        entered.set()
+        await release.wait()
+        return make_ack("first")
+
+    monkeypatch.setattr(daemon, "_handle", slow_handle)
+    ws = _FakeWS()
+
+    await daemon._on_frame(ws, dump_message(make_ack("first")))
+    await entered.wait()
+    await daemon._on_frame(ws, dump_message(make_ack("second")))
+
+    assert daemon._pending_requests == 1
+    assert len(daemon._dispatch_tasks) == 1
+    assert len(ws.sent) == 1
+    overloaded = parse_message(ws.sent[0])
+    assert overloaded.type == MessageType.ERROR
+    assert overloaded.payload.code == "SHIM_OVERLOADED"
+
+    release.set()
+    await asyncio.gather(*tuple(daemon._dispatch_tasks))
+
+
+async def test_cancel_dispatch_tasks_resets_capacity_and_cancels_handlers(
+    daemon: ShimDaemon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon.config.max_concurrent = 1
+    daemon._semaphore = asyncio.Semaphore(1)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_handle(_msg: Any, *, send: Any = None) -> AckMessage:
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(daemon, "_handle", slow_handle)
+    ws = _FakeWS()
+    await daemon._on_frame(ws, dump_message(make_ack("first")))
+    await entered.wait()
+
+    await daemon._cancel_dispatch_tasks()
+
+    assert cancelled.is_set()
+    assert daemon._pending_requests == 0
+    assert daemon._queue_depth == 0
+    assert daemon._in_flight == 0
+    assert not daemon._dispatch_tasks
+    assert daemon._available_capacity() == 1
+
+
+async def test_send_frame_replaces_oversized_response_with_correlated_error(
+    daemon: ShimDaemon,
+) -> None:
+    ws = _FakeWS()
+    response = CommandResultMessage(
+        id="oversized",
+        ts=now_ts(),
+        payload=CommandResultPayload(
+            stdout="\0" * (MAX_WEBSOCKET_MESSAGE_BYTES // 6),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+            duration_seconds=0,
+        ),
+    )
+
+    sent_original = await daemon._send_frame(ws, response)
+
+    assert sent_original is False
+    assert len(ws.sent) == 1
+    error = parse_message(ws.sent[0])
+    assert error.type == MessageType.ERROR
+    assert error.id == "oversized"
+    assert len(ws.sent[0].encode("utf-8")) < MAX_WEBSOCKET_MESSAGE_BYTES
 
 
 # ── Periodic ticker ─────────────────────────────────────────────────────────

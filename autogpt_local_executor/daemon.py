@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import random
-from typing import Any
+from typing import Any, Never
 
 import websockets
 from pydantic import BaseModel, ValidationError
@@ -34,9 +34,7 @@ from .handlers import (
     RecordingHandler,
 )
 from .protocol import (
-    VERSION as PROTOCOL_VERSION,
-)
-from .protocol import (
+    MAX_WEBSOCKET_MESSAGE_BYTES,
     AppLaunchMessage,
     AppListRequestMessage,
     ApplyRecordingReviewMessage,
@@ -80,6 +78,9 @@ from .protocol import (
     now_ts,
     parse_message,
 )
+from .protocol import (
+    VERSION as PROTOCOL_VERSION,
+)
 
 # How often the shim unprompted-emits a STATUS frame (backpressure / health).
 # Also emitted on the full → not-full capacity transition edge.
@@ -122,6 +123,10 @@ class DaemonPreflightError(RuntimeError):
     """
 
 
+class DaemonAuthenticationError(RuntimeError):
+    """Terminal WebSocket authentication or session-authorization failure."""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -147,6 +152,12 @@ class ShimDaemon:
         self._running = False
         self._ws: Any = None
         self._semaphore: asyncio.Semaphore | None = None
+        self._local_max_concurrent = config.max_concurrent
+        self._local_command_timeout_seconds = config.command_timeout_seconds
+        self._local_max_file_size_bytes = config.max_file_size_bytes
+        self._granted_capabilities: frozenset[str] = frozenset()
+        self._pending_requests = 0
+        self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._shim_start_logged = False
         # Effective negotiated protocol version, populated on HELLO_ACK.
         # `None` before handshake completes.
@@ -168,12 +179,8 @@ class ShimDaemon:
         self._status_task: asyncio.Task[None] | None = None
 
     @staticmethod
-    def _build_audit_writer(config: ShimConfig) -> AuditWriter | None:
-        """Best-effort AuditWriter construction. Returns None and emits a
-        warning when the audit key can't be acquired so the daemon can still
-        start in degraded mode; production deployments should treat this as
-        fatal but for v0 we don't want to brick a fresh install over a
-        keychain hiccup."""
+    def _build_audit_writer(config: ShimConfig) -> AuditWriter:
+        """Build the mandatory audit writer or fail startup closed."""
         try:
             key = get_or_create_audit_key()
             return AuditWriter(
@@ -183,28 +190,30 @@ class ShimDaemon:
                 session_id=config.session_id,
             )
         except Exception as exc:
-            logger.warning("Audit log disabled — could not acquire audit key: %s", exc)
-            return None
+            raise DaemonPreflightError(
+                "Audit initialization failed; refusing to run without a mandatory audit log"
+            ) from exc
 
     # ── Public API ────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Connect → handshake → pump messages, with exponential backoff
-        reconnect on any failure.
-        """
-        self._running = True
-        # Preflight: per Q5, refuse to bind if computer-use is requested
-        # but OS permissions are missing. We do this BEFORE shim_start
-        # audit so the audit log carries the failure record cleanly.
-        self._preflight_or_raise()
+        """Connect → handshake → pump messages, retrying only transient failures."""
+        # Fail closed on incomplete preview capabilities and missing OS
+        # permissions before opening the WebSocket.
+        await self._preflight_or_raise()
         await self._audit_shim_start()
+        self._running = True
         attempt = 0
         try:
             while self._running:
                 try:
                     await self._session()
-                    attempt = 0
                 except asyncio.CancelledError:
+                    raise
+                except DaemonAuthenticationError as exc:
+                    logger.error("Authentication rejected; will not auto-reconnect: %s", exc)
+                    self._disable_reconnect = True
+                    self._running = False
                     raise
                 except ProtocolVersionMismatch as exc:
                     # Refuse to retry: a hot-reconnect loop against an
@@ -233,6 +242,16 @@ class ShimDaemon:
                     )
                     await asyncio.sleep(delay)
                     attempt += 1
+                else:
+                    if not self._running or self._disable_reconnect:
+                        break
+                    delay = self._backoff_delay(0)
+                    logger.warning(
+                        "Connection closed cleanly. Reconnecting in %.1fs",
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    attempt = 0
         finally:
             await self._audit_shim_stop("graceful")
 
@@ -245,13 +264,15 @@ class ShimDaemon:
                 pass
 
     async def _audit_shim_start(self) -> None:
-        if self.audit is None or self._shim_start_logged:
+        if self._shim_start_logged:
             return
         try:
             await self.audit.shim_start(self.config.machine_id)
             self._shim_start_logged = True
-        except Exception:
-            logger.debug("SHIM_START audit emit failed", exc_info=True)
+        except Exception as exc:
+            raise DaemonPreflightError(
+                "Mandatory audit log rejected its initial SHIM_START record"
+            ) from exc
 
     async def _audit_shim_stop(self, reason: str) -> None:
         if self.audit is None or not self._shim_start_logged:
@@ -281,23 +302,43 @@ class ShimDaemon:
                 additional_headers=headers,
                 ping_interval=20,
                 ping_timeout=10,
+                max_size=MAX_WEBSOCKET_MESSAGE_BYTES,
             ) as ws:
                 await self._run_session(ws)
         except websockets.exceptions.InvalidStatus as exc:
             status_code = getattr(exc.response, "status_code", None)
+            if status_code == 403:
+                raise DaemonAuthenticationError(
+                    "WebSocket session access was denied (HTTP 403); token refresh was not attempted"
+                ) from exc
             if status_code != 401:
                 raise
-            # On 401, try refreshing once and retry the connect.
+            # A 401 may mean the access token expired. Refresh exactly once;
+            # authorization denials (403) never rotate credentials.
             logger.info("401 on WebSocket upgrade — refreshing token and retrying once")
             token = await self._get_access_token(refresh_on_fail=True)
+            if not token:
+                raise DaemonAuthenticationError(
+                    "WebSocket authentication failed and the single token refresh failed"
+                ) from exc
             headers = self._auth_headers(token)
-            async with websockets.connect(
-                url,
-                additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=10,
-            ) as ws:
-                await self._run_session(ws)
+            try:
+                async with websockets.connect(
+                    url,
+                    additional_headers=headers,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    max_size=MAX_WEBSOCKET_MESSAGE_BYTES,
+                ) as ws:
+                    await self._run_session(ws)
+            except websockets.exceptions.InvalidStatus as retry_exc:
+                retry_status = getattr(retry_exc.response, "status_code", None)
+                if retry_status in (401, 403):
+                    raise DaemonAuthenticationError(
+                        "WebSocket authentication remained denied after one refresh "
+                        f"(HTTP {retry_status})"
+                    ) from retry_exc
+                raise
 
     async def _run_session(self, ws) -> None:
         self._ws = ws
@@ -305,6 +346,7 @@ class ShimDaemon:
         # Reset per-session counters so reconnects don't carry over.
         self._in_flight = 0
         self._queue_depth = 0
+        self._pending_requests = 0
         if self.audit is not None:
             try:
                 await self.audit.ws_connected(self._connect_url())
@@ -319,6 +361,8 @@ class ShimDaemon:
             try:
                 async for raw in ws:
                     await self._on_frame(ws, raw)
+                    if self._disable_reconnect:
+                        break
             except websockets.exceptions.ConnectionClosed as exc:
                 # Translate fatal application close codes into the
                 # _disable_reconnect flag so run() doesn't loop on us.
@@ -349,6 +393,7 @@ class ShimDaemon:
                 disconnect_reason = f"loop_error: {exc.__class__.__name__}"
                 raise
         finally:
+            await self._cancel_dispatch_tasks()
             # Cancel the periodic STATUS ticker first so it doesn't fight
             # us for the dying WS.
             if self._status_task is not None:
@@ -366,8 +411,21 @@ class ShimDaemon:
                 except Exception:
                     logger.debug("WS_DISCONNECTED audit emit failed", exc_info=True)
 
+    async def _cancel_dispatch_tasks(self) -> None:
+        tasks = tuple(self._dispatch_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._dispatch_tasks.clear()
+        self._pending_requests = 0
+        self._queue_depth = 0
+        self._in_flight = 0
+
     def _connect_url(self) -> str:
-        session_id = self.config.session_id or "default"
+        session_id = (self.config.session_id or "").strip()
+        if not session_id:
+            raise ValueError("A nonempty session_id is required to connect the shim")
         base = self.config.derived_ws_url.rstrip("/")
         return f"{base}/{session_id}"
 
@@ -378,12 +436,10 @@ class ShimDaemon:
         return {"Authorization": f"Bearer {token}"}
 
     async def _get_access_token(self, *, refresh_on_fail: bool) -> str | None:
-        token = await self.token_store.get_access_token()
-        if token is not None:
-            return token
         if not refresh_on_fail:
-            return None
-        # Try to refresh.
+            return await self.token_store.get_access_token()
+        # The server rejected the current access token. Force a refresh even
+        # though the rejected token is still present in the keychain.
         try:
             from .auth import OAuthFlow
 
@@ -409,13 +465,37 @@ class ShimDaemon:
             except Exception:
                 logger.debug("computer-use on_hello failed", exc_info=True)
         hello = await self._build_hello()
-        await ws.send(dump_message(hello))
+        raw_hello = dump_message(hello)
+        if len(raw_hello.encode("utf-8")) > MAX_WEBSOCKET_MESSAGE_BYTES:
+            await ws.close(code=4400, reason="HELLO payload too large")
+            self._disable_reconnect = True
+            raise RuntimeError("HELLO payload exceeds the WebSocket message limit")
+        await ws.send(raw_hello)
         raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
         ack = parse_message(raw_ack)
         if not isinstance(ack, HelloAckMessage):
             raise RuntimeError(f"Expected HELLO_ACK, got {type(ack).__name__}")
+        if ack.id != hello.id:
+            await ws.close(code=4400, reason="HELLO_ACK correlation mismatch")
+            self._disable_reconnect = True
+            raise RuntimeError("HELLO_ACK id does not match HELLO id")
         # Honor the server's negotiated limits.
         payload = ack.payload
+        expected_session_id = (self.config.session_id or "").strip()
+        if payload.session_id != expected_session_id:
+            await ws.close(code=4403, reason="HELLO_ACK session mismatch")
+            raise DaemonAuthenticationError(
+                "HELLO_ACK session does not match the locally selected session"
+            )
+        advertised_capabilities = set(hello.payload.capabilities)
+        unexpected_capabilities = set(payload.granted_capabilities) - advertised_capabilities
+        if unexpected_capabilities:
+            await ws.close(code=4400, reason="HELLO_ACK granted unadvertised capability")
+            self._disable_reconnect = True
+            raise RuntimeError(
+                "HELLO_ACK granted capabilities the shim did not advertise: "
+                + ", ".join(sorted(unexpected_capabilities))
+            )
         # Negotiate wire-protocol version BEFORE applying any other limits.
         # If majors disagree we tear the WS down with 4426 and surface
         # ProtocolVersionMismatch so the run() loop disables reconnect.
@@ -434,10 +514,20 @@ class ShimDaemon:
             except Exception:
                 logger.debug("ws.close after version mismatch failed", exc_info=True)
             raise
-        self.config.max_concurrent = payload.max_concurrent
-        self.config.command_timeout_seconds = payload.command_timeout_seconds
-        self.config.max_file_size_bytes = payload.max_file_size_bytes
-        self._semaphore = asyncio.Semaphore(payload.max_concurrent)
+        self.config.max_concurrent = min(
+            self._local_max_concurrent,
+            payload.max_concurrent,
+        )
+        self.config.command_timeout_seconds = min(
+            self._local_command_timeout_seconds,
+            payload.command_timeout_seconds,
+        )
+        self.config.max_file_size_bytes = min(
+            self._local_max_file_size_bytes,
+            payload.max_file_size_bytes,
+        )
+        self._granted_capabilities = frozenset(payload.granted_capabilities)
+        self._semaphore = asyncio.Semaphore(self.config.max_concurrent)
         # Tell the AuditWriter about the now-known session_id so subsequent
         # records get correctly attributed.
         if self.audit is not None:
@@ -451,8 +541,8 @@ class ShimDaemon:
             "timeout=%ds protocol=%s",
             payload.session_id,
             payload.granted_capabilities,
-            payload.max_concurrent,
-            payload.command_timeout_seconds,
+            self.config.max_concurrent,
+            self.config.command_timeout_seconds,
             self._negotiated_version,
         )
         return ack
@@ -497,11 +587,19 @@ class ShimDaemon:
         recording_channels: list[str] = []
         recording_routes: list[str] = []
         if "recording" in caps:
-            recording_channels = list(cfg.recording_channels)
-            recording_routes = self._available_recording_routes(
-                channels=recording_channels,
-                local_llm_models=local_llm_models,
-            )
+            native_channels = set(platform_info.available_recording_channels())
+            recording_channels = [
+                channel for channel in cfg.recording_channels if channel in native_channels
+            ]
+            if recording_channels:
+                recording_routes = self._available_recording_routes(
+                    channels=recording_channels,
+                    local_llm_models=local_llm_models,
+                )
+            else:
+                caps = [capability for capability in caps if capability != "recording"]
+        self._recording_handler.set_available_channels(recording_channels)
+        self._recording_handler.set_local_llm_models(local_llm_models)
         payload = HelloPayload(
             shim_version=__import__("autogpt_local_executor").__version__,
             machine_id=cfg.machine_id,
@@ -558,7 +656,7 @@ class ShimDaemon:
         # PING is handled inline so a saturated semaphore can't starve keepalive.
         if isinstance(msg, PingMessage):
             try:
-                await ws.send(dump_message(make_pong(msg.id)))
+                await self._send_frame(ws, make_pong(msg.id))
             except Exception:
                 logger.debug("Failed to send PONG", exc_info=True)
             return
@@ -573,7 +671,22 @@ class ShimDaemon:
             # We somehow got a request before HELLO_ACK; be defensive.
             self._semaphore = asyncio.Semaphore(self.config.max_concurrent)
 
-        asyncio.create_task(self._dispatch(ws, msg))
+        if self._pending_requests >= self.config.max_concurrent:
+            response = make_error(
+                msg.id,
+                ErrorCode.SHIM_OVERLOADED,
+                "The local executor is at its concurrent request limit.",
+                details={"max_concurrent": self.config.max_concurrent},
+            )
+            response.pending_capacity = 0
+            await self._send_frame(ws, response)
+            return
+
+        self._pending_requests += 1
+        self._queue_depth += 1
+        task = asyncio.create_task(self._dispatch(ws, msg, prequeued=True))
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(self._dispatch_tasks.discard)
 
     async def _handle_session_revoked(self, ws, msg: SessionRevokedMessage) -> None:
         """Per PROTOCOL.md → Session ownership: log, stop sending, close,
@@ -663,7 +776,7 @@ class ShimDaemon:
         """
         try:
             msg = self._build_status_message()
-            await ws.send(dump_message(msg))
+            await self._send_frame(ws, msg)
             logger.debug("STATUS emitted (%s): %s", source, msg.payload)
         except Exception:
             logger.debug("STATUS emit failed (%s)", source, exc_info=True)
@@ -681,12 +794,14 @@ class ShimDaemon:
         except asyncio.CancelledError:
             raise
 
-    async def _dispatch(self, ws, msg: Any) -> None:
+    async def _dispatch(self, ws, msg: Any, *, prequeued: bool = False) -> None:
         assert self._semaphore is not None
         # Track queue depth: incremented now, decremented exactly once when
         # we either acquire the semaphore (transition to in_flight) or bail
         # out before acquiring (cancellation / error in waiter).
-        self._queue_depth += 1
+        if not prequeued:
+            self._pending_requests += 1
+            self._queue_depth += 1
         queue_owed = True
         in_flight_owed = False
         was_full_after_decrement = False
@@ -699,7 +814,7 @@ class ShimDaemon:
         # treated as responses for the backpressure accounting.
         async def _stream_send(frame: Any) -> None:
             try:
-                await ws.send(dump_message(frame))
+                await self._send_frame(ws, frame)
             except Exception:
                 logger.debug("Failed to send streaming frame", exc_info=True)
 
@@ -714,7 +829,10 @@ class ShimDaemon:
                     try:
                         response = await self._handle(msg, send=_stream_send)
                     finally:
-                        was_full_after_decrement = self._in_flight == self.config.max_concurrent
+                        was_full_after_decrement = (
+                            self._pending_requests >= self.config.max_concurrent
+                            or self._in_flight == self.config.max_concurrent
+                        )
                         self._in_flight -= 1
                         in_flight_owed = False
             except Exception as exc:
@@ -732,6 +850,7 @@ class ShimDaemon:
                 self._queue_depth -= 1
             if in_flight_owed:
                 self._in_flight -= 1
+            self._pending_requests = max(self._pending_requests - 1, 0)
 
         if response is None:
             return
@@ -747,7 +866,7 @@ class ShimDaemon:
             logger.debug("could not stamp pending_capacity", exc_info=True)
 
         try:
-            await ws.send(dump_message(response))
+            await self._send_frame(ws, response)
         except Exception:
             logger.debug("Failed to send response", exc_info=True)
 
@@ -759,7 +878,25 @@ class ShimDaemon:
 
     def _available_capacity(self) -> int:
         """Free request slots right now. Floored at 0."""
-        return max(self.config.max_concurrent - self._in_flight, 0)
+        occupied = max(
+            self._pending_requests,
+            self._in_flight + self._queue_depth,
+        )
+        return max(self.config.max_concurrent - occupied, 0)
+
+    async def _send_frame(self, ws, frame: BaseModel) -> bool:
+        raw = dump_message(frame)
+        if len(raw.encode("utf-8")) > MAX_WEBSOCKET_MESSAGE_BYTES:
+            fallback = make_error(
+                getattr(frame, "id", new_id()),
+                ErrorCode.FILE_TOO_LARGE,
+                "The local executor response exceeded the WebSocket message limit.",
+            )
+            fallback.pending_capacity = self._available_capacity()
+            await ws.send(dump_message(fallback))
+            return False
+        await ws.send(raw)
+        return True
 
     _COMPUTER_USE_MESSAGE_TYPES = (
         ScreenshotRequestMessage,
@@ -775,7 +912,51 @@ class ShimDaemon:
         PermissionsCheckRequestMessage,
     )
 
+    _FILE_MESSAGE_TYPES = (
+        FileReadMessage,
+        FileWriteMessage,
+        FileStatMessage,
+        FileListMessage,
+        FileDeleteMessage,
+        FileMoveMessage,
+    )
+
+    _RECORDING_MESSAGE_TYPES = (
+        RequestRecordingConsentMessage,
+        StartRecordingMessage,
+        StopRecordingMessage,
+        ApplyRecordingReviewMessage,
+        RecordingFetchMessage,
+    )
+
+    def _required_capability(self, msg: Any) -> str | None:
+        if isinstance(msg, ExecuteCommandMessage):
+            return "shell"
+        if isinstance(msg, self._FILE_MESSAGE_TYPES):
+            return "files"
+        if isinstance(msg, self._COMPUTER_USE_MESSAGE_TYPES):
+            return "computer_use"
+        if isinstance(msg, LocalLLMCompletionMessage):
+            return "local_llm"
+        if isinstance(msg, self._RECORDING_MESSAGE_TYPES):
+            return "recording"
+        return None
+
     async def _handle(self, msg: Any, *, send: Any | None = None) -> BaseModel | None:
+        required_capability = self._required_capability(msg)
+        if (
+            required_capability is not None
+            and required_capability not in self._granted_capabilities
+        ):
+            return make_error(
+                msg.id,
+                ErrorCode.CAPABILITY_NOT_GRANTED,
+                f"The platform did not grant the {required_capability!r} capability.",
+                details={
+                    "required_capability": required_capability,
+                    "granted_capabilities": sorted(self._granted_capabilities),
+                },
+            )
         if isinstance(msg, ExecuteCommandMessage):
             return await self._command_handler.handle(msg)
         if isinstance(msg, FileReadMessage):
@@ -794,16 +975,7 @@ class ShimDaemon:
             return await self._computer_handler.handle(msg)
         if isinstance(msg, LocalLLMCompletionMessage):
             return await self._local_llm_handler.handle(msg, send=send)
-        if isinstance(
-            msg,
-            (
-                RequestRecordingConsentMessage,
-                StartRecordingMessage,
-                StopRecordingMessage,
-                ApplyRecordingReviewMessage,
-                RecordingFetchMessage,
-            ),
-        ):
+        if isinstance(msg, self._RECORDING_MESSAGE_TYPES):
             # START/STOP/FETCH are request/response ops that count against
             # in-flight (§6). The `send` callback lets START stream unsolicited
             # RECORDING_STEP frames in co-pilot mode (exempt from accounting,
@@ -815,11 +987,15 @@ class ShimDaemon:
 
     # ── Preflight ────────────────────────────────────────────────────
 
-    def _preflight_or_raise(self) -> None:
-        """Per COMPUTER_USE.md Q5: when computer_use is requested but the
-        required OS permission isn't granted, write a structured audit
-        record and raise DaemonPreflightError so the CLI exits 78.
-        """
+    async def _preflight_or_raise(self) -> None:
+        """Reject incomplete previews or unverified required OS permissions."""
+        if self.config.enable_recording:
+            await self._fail_preflight(
+                "Workflow recording is a design preview and remains disabled: "
+                "capture and interpretation are incomplete, so the shim will not advertise it.",
+                missing_permissions=["recording_preview_disabled"],
+                error_code=ErrorCode.CAPABILITY_NOT_GRANTED,
+            )
         if not self.config.enable_computer_use:
             return
         plat = platform_info.detect_platform()
@@ -830,50 +1006,62 @@ class ShimDaemon:
                 AXIsProcessTrusted,
             )
         except ImportError:
-            # No pyobjc — can't check. Treat as a warning, not a fail.
-            logger.warning("Cannot probe Accessibility: pyobjc/ApplicationServices not installed.")
-            return
+            await self._fail_preflight(
+                "Cannot verify Accessibility permission because "
+                "pyobjc/ApplicationServices is unavailable. Run `autogpt-shim doctor`.",
+                missing_permissions=["accessibility_probe"],
+                error_code=ErrorCode.DEPENDENCY_MISSING,
+            )
         try:
             trusted = bool(AXIsProcessTrusted())
         except Exception as exc:
-            logger.warning("AXIsProcessTrusted() failed: %s", exc)
-            return
+            await self._fail_preflight(
+                f"Could not verify Accessibility permission: {exc}. Run `autogpt-shim doctor`.",
+                missing_permissions=["accessibility_probe"],
+                error_code=ErrorCode.PERMISSION_PENDING,
+            )
         if trusted:
             return
-        # Refuse to bind. Emit a synthetic audit entry so the user has
-        # a record of the refusal.
-        if self.audit is not None:
-            try:
-                # Use the existing write helper with a synthetic op name.
-                # We don't await here from a sync method; just queue best-effort.
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-                if loop is not None:
-                    loop.create_task(
-                        self.audit.write(
-                            "DAEMON_PREFLIGHT_FAILED",
-                            request_id=new_id(),
-                            details={
-                                "missing_permissions": ["accessibility"],
-                                "platform": plat,
-                                "hint": "Run `autogpt-shim doctor` and grant access.",
-                            },
-                            result={
-                                "ok": False,
-                                "exit_code": 78,
-                                "duration_ms": 0,
-                                "error_code": ErrorCode.PERMISSION_PENDING.value,
-                            },
-                        )
-                    )
-            except Exception:
-                logger.debug("preflight audit emit failed", exc_info=True)
-        raise DaemonPreflightError(
+        await self._fail_preflight(
             "Accessibility permission not granted; computer_use requires it. "
-            "Run `autogpt-shim doctor` to surface the prompt."
+            "Run `autogpt-shim doctor` to surface the prompt.",
+            missing_permissions=["accessibility"],
+            error_code=ErrorCode.PERMISSION_PENDING,
         )
 
+    async def _fail_preflight(
+        self,
+        message: str,
+        *,
+        missing_permissions: list[str],
+        error_code: ErrorCode,
+    ) -> Never:
+        try:
+            await self.audit.write(
+                "DAEMON_PREFLIGHT_FAILED",
+                request_id=new_id(),
+                details={
+                    "missing_permissions": missing_permissions,
+                    "platform": platform_info.detect_platform(),
+                    "hint": "Run `autogpt-shim doctor` and grant required access.",
+                },
+                result={
+                    "ok": False,
+                    "exit_code": 78,
+                    "duration_ms": 0,
+                    "error_code": error_code.value,
+                },
+            )
+        except Exception as exc:
+            raise DaemonPreflightError(
+                f"{message} Mandatory preflight audit write also failed."
+            ) from exc
+        raise DaemonPreflightError(message)
 
-__all__ = ["ShimDaemon"]
+
+__all__ = [
+    "MAX_WEBSOCKET_MESSAGE_BYTES",
+    "DaemonAuthenticationError",
+    "DaemonPreflightError",
+    "ShimDaemon",
+]

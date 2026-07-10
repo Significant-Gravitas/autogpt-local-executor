@@ -10,7 +10,7 @@
 
 | Threat | Severity | Mitigation |
 |--------|----------|------------|
-| Prompt injection causing arbitrary command execution | Critical | Command audit log; user-configurable allow/deny lists |
+| Prompt injection causing arbitrary command execution | Critical | Shell disabled by default; explicit local opt-in; command audit log |
 | Shim token stolen → attacker controls machine | Critical | OS keychain storage; token scoped to `local_executor` only |
 | Path traversal outside allowed_root | High | Shim enforces path jail; platform validates paths before sending |
 | Platform compromise → all shims pwned | High | Shim can block platform-side: capability gates, rate limits, local confirm prompts |
@@ -30,16 +30,27 @@
 
 ## Defense Layers
 
-### Layer 1: OAuth Scope Gates
-Every capability requires an explicit OAuth scope granted by the user. The platform cannot
-issue shell commands to a shim that only has `local_executor:files` scope.
+### Layer 1: OAuth and Local Capability Gates
+The public shim client receives the existing `USE_TOOLS` OAuth permission.
+Individual local capabilities are a separate, shim-enforced boundary: shell,
+computer use, clipboard access, local models, and hardware are only advertised
+when their local configuration gates are enabled and their runtime dependencies
+are available. Recording is stricter: it remains a design preview, is never
+advertised, and causes startup to fail closed if enabled. The platform's grant
+cannot turn on a locally disabled capability.
 
 ### Layer 2: Allowed Root Path Jail
-All file operations are jailed to `allowed_root` (configured by user at shim startup).
+All `FILE_*` operations are jailed to `allowed_root` (configured by user at shim startup).
 The full algorithm is in [CROSS_PLATFORM.md → Path Jail Strategy](CROSS_PLATFORM.md#path-jail-strategy);
 a naive `path.startswith(allowed_root)` check is **not enough** and the shim
 must use the prescribed algorithm. Violation → `PATH_OUTSIDE_ALLOWED_ROOT`
 error, no execution.
+
+**This jail is not a shell sandbox.** When the user explicitly enables shell
+execution, both shell strings and direct `argv` processes run with the shim
+user's normal OS permissions. Validating the subprocess working directory does
+not stop a command from reading, writing, executing, or making network requests
+outside `allowed_root`. Treat `--enable-shell` as user-account-level access.
 
 Recommended: create a dedicated workspace directory, not your home dir.
 ```
@@ -75,12 +86,15 @@ modification. Full format, per-op fields, the tamper-evidence
 algorithm, and the `autogpt-shim audit` CLI are spec'd in
 [AUDIT_LOG.md](AUDIT_LOG.md). The audit key never leaves the machine;
 the user provides it out-of-band when uploading a log for support.
+Audit initialization is mandatory: if the key or writer cannot be created,
+daemon construction fails and the CLI exits with `EX_CONFIG` rather than
+running in an unaudited degraded mode.
 
 ### Layer 4: Rate Limiting (Shim-Side)
 Shim enforces:
 - Max 60 commands per minute per session
-- Max 10 concurrent commands
-- Max 100MB per file read/write
+- Max 10 concurrent commands, additionally bounded by negotiated `max_concurrent`
+- Max 10 MiB per file read/write by default; text responses reserve JSON framing headroom
 - Max 10 screenshots per minute (computer use)
 
 Exceeding limits → `SHIM_OVERLOADED` error returned to platform.
@@ -103,14 +117,14 @@ Requires Linux + root for namespace setup, or a bubblewrap wrapper.
 |-----------|---------|----------|
 | Read files in allowed_root | ✅ | — |
 | Write files in allowed_root | ✅ | — |
-| Execute shell commands | ✅ | `--no-shell` flag |
+| Execute shell commands | ❌ | `start --enable-shell` (unrestricted user-level access) |
 | Access files outside allowed_root | ❌ | Expand allowed_root (explicit) |
 | Take screenshots | ❌ | `local_executor:computer_use` scope |
 | Inject mouse/keyboard | ❌ | `local_executor:computer_use` scope |
 | Access serial/USB/GPIO | ❌ | `local_executor:hardware` scope |
 | Run as root / sudo | ❌ | Not supported, period |
 | Background tasks when user absent | ❌ | `local_executor:background` scope |
-| Access the internet via commands | ✅ (via shell) | `--no-network` flag (Linux only) |
+| Access the internet via commands | ❌ (shell is off) | Shell commands may use the network after `--enable-shell` |
 
 ---
 
@@ -119,9 +133,13 @@ Requires Linux + root for namespace setup, or a bubblewrap wrapper.
 - Tokens stored in OS keychain (never in dotfiles or env vars)
 - Access token short-lived (1 hour); refresh token used for renewal
 - Refresh token stored encrypted in keychain
-- `autogpt-shim revoke` — revokes all tokens and disconnects immediately
-- On platform side: `POST /auth/revoke` invalidates all shim tokens for a user
-- Tokens scoped to `local_executor:*` only — cannot be used to call other AutoGPT APIs
+- `autogpt-shim revoke` posts both access and refresh tokens to
+  `POST /api/oauth/revoke` as the public client, and only then clears the OS
+  keychain. A network/server error preserves local tokens so revocation can be
+  retried instead of falsely reporting success.
+- A successful platform revocation also pushes session revocation to connected shims.
+- Tokens carry `USE_TOOLS`; the WebSocket additionally checks session ownership,
+  client identity, and local capability gates.
 
 ### Per-OS Keychain Availability
 
@@ -151,7 +169,7 @@ better either — the keychain backends remain the recommended path.
 
 If you believe your shim was compromised:
 
-1. `autogpt-shim stop` — immediately stops the daemon
+1. Stop the foreground daemon with Ctrl+C, or stop its launchd/systemd/Task Scheduler entry.
 2. `autogpt-shim revoke` — revokes all OAuth tokens
 3. Review the audit log at the per-OS location (see [AUDIT_LOG.md](AUDIT_LOG.md)) with `autogpt-shim audit tail` / `verify`
 4. Change your AutoGPT account password and re-enable 2FA
@@ -161,10 +179,11 @@ If you believe your shim was compromised:
 
 ## Known Limitations of v0 (MVP)
 
-- No command allow/deny lists yet (all shell commands permitted within allowed_root)
+- No command allow/deny lists yet (after opt-in, shell commands have the shim
+  user's normal access and are not confined to `allowed_root`)
 - No local confirmation prompts yet
 - No network isolation
-- Audit log tamper-evidence is spec'd ([AUDIT_LOG.md](AUDIT_LOG.md)) but not yet implemented in the shim daemon
+- Audit records are HMAC-chained; protect the audit key in the OS keychain.
 - Computer use has no "sensitive region" masking (entire screen captured)
 - Shim crash does not guarantee in-flight commands are cancelled
 

@@ -54,15 +54,22 @@ def test_detect_arch_rejects_unknown() -> None:
 
 def test_detect_capabilities_minimal() -> None:
     caps = platform_info.detect_capabilities()
-    assert "shell" in caps
+    assert "shell" not in caps
     assert "files" in caps
     assert "computer_use" not in caps
 
 
-def test_detect_capabilities_omits_shell_when_disabled() -> None:
-    caps = platform_info.detect_capabilities(enable_shell=False)
-    assert "shell" not in caps
+def test_detect_capabilities_includes_shell_only_when_enabled() -> None:
+    caps = platform_info.detect_capabilities(enable_shell=True)
+    assert "shell" in caps
     assert "files" in caps
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux", "windows", "wsl2"])
+def test_recording_design_preview_is_never_advertised(platform_name: str) -> None:
+    with patch.object(platform_info, "detect_platform", return_value=platform_name):
+        assert platform_info.available_recording_channels() == []
+        assert "recording" not in platform_info.detect_capabilities(enable_recording=True)
 
 
 def test_default_allowed_root_per_os(monkeypatch: pytest.MonkeyPatch) -> None:

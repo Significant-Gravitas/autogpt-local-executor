@@ -14,21 +14,22 @@ scripted test list.
             ├── ScreenshotActionFloor (universal floor; wraps screenshot backend)
             └── A11yEnricher          (wraps a floor source, attaches AX enrichment)
 
-WHERE THE REAL OS-HOOK AUTHOR PLUGS IN
+WHERE NATIVE OS-HOOK PRODUCERS PLUG IN
 --------------------------------------
-The genuinely OS-specific part — observing the user's *input* (the click/keys
-that mark "a step happened") — CANNOT be validated in this environment and is
-NOT built here. It is itself a `CaptureSource`:
+The genuinely OS-specific part observes the user's *input* (the click/keys
+that mark "a step happened"). The production macOS producer is
+`MacInputCaptureSource`; Windows and Linux producers have not landed. Each is
+itself a `CaptureSource`:
 
     `ScreenshotActionFloor(input_events=<real OS input-hook CaptureSource>)`
 
 The floor consumes a stream of *input-event* steps from its injected
 `input_events` source and, for each, snapshots the pre-action frame + cursor +
-active app/window to fill the floor fields. To land real per-OS capture, write
-a `CaptureSource` whose `steps()` yields one step per observed user action
-(macOS `CGEventTap`, Windows `SetWindowsHookEx`, Linux X11 `XRecord`) and pass
-it as `input_events`. No other layer changes. The `MockCaptureSource` is the
-reference shape for that producer.
+active app/window to fill the floor fields. To add another OS, write a
+`CaptureSource` whose `steps()` yields one step per observed user action
+(Windows `SetWindowsHookEx`, Linux X11 `XRecord`) and pass it as
+`input_events`. No other layer changes. The `MockCaptureSource` remains the
+reference test shape.
 
 Browser DOM enrichment is NOT built here: it arrives from the platform/extension
 side (the claude-in-chrome channel) as already-`dom`-kind steps on the wire;

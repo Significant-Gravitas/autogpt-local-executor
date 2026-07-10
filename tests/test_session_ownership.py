@@ -81,6 +81,10 @@ class _FakeWebSocket:
         nxt = self._inbound.pop(0)
         if isinstance(nxt, BaseException):
             raise nxt
+        payload = json.loads(nxt)
+        if payload.get("type") == "HELLO_ACK" and payload.get("id") == "__HELLO_ID__":
+            payload["id"] = json.loads(self.sent[0])["id"]
+            return json.dumps(payload)
         return nxt
 
     def __aiter__(self) -> _FakeWebSocket:
@@ -160,13 +164,13 @@ def daemon(shim_config: ShimConfig, audit: _RecordingAudit) -> ShimDaemon:
 
 def _hello_ack() -> str:
     payload = HelloAckPayload(
-        session_id="s1",
-        granted_capabilities=["shell"],
+        session_id="test-session",
+        granted_capabilities=["files"],
         max_file_size_bytes=1024,
         command_timeout_seconds=30,
         max_concurrent=4,
     )
-    return dump_message(HelloAckMessage(id=new_id(), ts=now_ts(), payload=payload))
+    return dump_message(HelloAckMessage(id="__HELLO_ID__", ts=now_ts(), payload=payload))
 
 
 def _session_revoked_frame(
@@ -280,14 +284,15 @@ async def test_fatal_close_codes_disable_reconnect(
     assert revoked[0]["reason"] == expected_reason_label
 
 
+@pytest.mark.parametrize("close_code", [1011, 4401])
 async def test_non_fatal_close_code_does_NOT_disable_reconnect(
-    daemon: ShimDaemon, audit: _RecordingAudit
+    daemon: ShimDaemon, audit: _RecordingAudit, close_code: int
 ) -> None:
-    """RFC-range close (e.g. 1011) is treated as transient — shim retries."""
+    """Transient and access-token-expiry closes allow reconnect and refresh."""
     ws = _FakeWebSocket(
         inbound=[
             _hello_ack(),
-            _make_connection_closed(code=1011, reason="server error"),
+            _make_connection_closed(code=close_code, reason="retryable"),
         ]
     )
     with pytest.raises(websockets.exceptions.ConnectionClosed):

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from autogpt_local_executor.config import ShimConfig, load_config
 
 
@@ -14,6 +17,8 @@ def test_default_values_present() -> None:
     assert cfg.max_concurrent == 4
     assert cfg.command_timeout_seconds == 30
     assert cfg.max_file_size_bytes == 10 * 1024 * 1024
+    assert cfg.enable_shell is False
+    assert cfg.recording_retention_limit == 10
 
 
 def test_env_var_override(monkeypatch) -> None:
@@ -65,9 +70,30 @@ def test_derived_oauth_token_url_from_wss() -> None:
     assert cfg.derived_oauth_token_url == "https://platform.example.com/api/oauth/token"
 
 
+def test_derived_oauth_revoke_url_from_wss() -> None:
+    cfg = ShimConfig(platform_url="wss://platform.example.com")
+    assert cfg.derived_oauth_revoke_url == "https://platform.example.com/api/oauth/revoke"
+
+
 def test_explicit_overrides_take_priority() -> None:
     cfg = ShimConfig(
         platform_url="https://x",
         platform_ws_url="ws://explicit-override/ws",
     )
     assert cfg.derived_ws_url == "ws://explicit-override/ws"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_concurrent",
+        "max_concurrent_commands",
+        "command_timeout_seconds",
+        "max_file_size_bytes",
+        "max_commands_per_minute",
+        "max_screenshots_per_minute",
+    ],
+)
+def test_security_limits_must_be_positive(field: str) -> None:
+    with pytest.raises(ValidationError):
+        ShimConfig.model_validate({field: 0})

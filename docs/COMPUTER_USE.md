@@ -639,6 +639,11 @@ multi-app workflow is half-blind without clipboard access.
 
 Responds with `ACK`.
 
+Both clipboard directions are bounded by
+`HELLO_ACK.max_file_size_bytes`. `CLIPBOARD_READ` rejects an oversized backend
+result, and `CLIPBOARD_WRITE` measures UTF-8 bytes before touching the OS
+clipboard; either returns `FILE_TOO_LARGE`.
+
 Security note: clipboard content is **redacted in the audit log** (size +
 SHA-256 prefix only, never the value — same rule as `INPUT_ACTION.text`
 per [AUDIT_LOG.md](AUDIT_LOG.md)). A `CLIPBOARD_READ` always emits a

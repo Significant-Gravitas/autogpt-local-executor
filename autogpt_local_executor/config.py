@@ -90,7 +90,10 @@ class ShimConfig(BaseSettings):
     )
 
     # ── Session ────────────────────────────────────────────────────────────
-    session_id: str | None = Field(default=None)
+    session_id: str | None = Field(
+        default=None,
+        description="Platform copilot session to attach to. Required when starting the daemon.",
+    )
 
     # ── Identity ───────────────────────────────────────────────────────────
     machine_id: str = Field(
@@ -109,20 +112,25 @@ class ShimConfig(BaseSettings):
     )
 
     # ── Capabilities (advertised in HELLO) ─────────────────────────────────
-    enable_shell: bool = Field(default=True)
+    enable_shell: bool = Field(
+        default=False,
+        description="Allow unrestricted user-level shell execution. The allowed_root jail "
+        "does not constrain shell commands.",
+    )
     enable_computer_use: bool = Field(default=False)
     enable_local_llm: bool = Field(default=False)
     enable_hardware: bool = Field(default=False)
 
     # ── Limits (also negotiated via HELLO_ACK) ─────────────────────────────
-    max_concurrent: int = Field(default=4, description="Concurrent in-flight requests.")
+    max_concurrent: int = Field(default=4, gt=0, description="Concurrent in-flight requests.")
     max_concurrent_commands: int = Field(
         default=10,
-        description="Concurrent EXECUTE_COMMAND requests (≤ max_concurrent).",
+        gt=0,
+        description="Local ceiling for concurrent EXECUTE_COMMAND requests.",
     )
-    command_timeout_seconds: int = Field(default=30)
-    max_file_size_bytes: int = Field(default=10 * 1024 * 1024)  # 10 MiB
-    max_commands_per_minute: int = Field(default=60)
+    command_timeout_seconds: int = Field(default=30, gt=0)
+    max_file_size_bytes: int = Field(default=10 * 1024 * 1024, gt=0)  # 10 MiB
+    max_commands_per_minute: int = Field(default=60, gt=0)
 
     # ── Reconnect ──────────────────────────────────────────────────────────
     reconnect_base_delay: float = Field(default=1.0)
@@ -138,7 +146,7 @@ class ShimConfig(BaseSettings):
     )
 
     # ── Computer use ───────────────────────────────────────────────────────
-    max_screenshots_per_minute: int = Field(default=10)
+    max_screenshots_per_minute: int = Field(default=10, gt=0)
     enable_clipboard: bool = Field(
         default=False,
         description="Allow CLIPBOARD_READ / CLIPBOARD_WRITE. Without this "
@@ -157,15 +165,15 @@ class ShimConfig(BaseSettings):
     # ── Workflow recording (see docs/WORKFLOW_RECORDING.md) ────────────────
     enable_recording: bool = Field(
         default=False,
-        description="Advertise the 'recording' capability and accept "
-        "START_RECORDING. Requires the screenshot floor (computer_use). See "
-        "docs/WORKFLOW_RECORDING.md §6.",
+        description="Design-preview switch. Startup intentionally fails closed "
+        "when enabled because capture and interpretation are not production-ready. "
+        "The recording capability is never advertised.",
     )
     recording_buffer_dir: Path | None = Field(
         default=None,
         description="Directory for the encrypted recording buffer. Defaults "
-        "to a 'recordings' subdir next to the audit log. Buffers are "
-        "secure-erased after skill generation unless pinned (§9).",
+        "to a 'recordings' subdir next to the audit log. Evicted buffers are "
+        "best-effort secure-erased (§9).",
     )
     recording_default_interpretation_route: str = Field(
         default="extract_then_cloud",
@@ -174,9 +182,13 @@ class ShimConfig(BaseSettings):
     )
     recording_channels: list[str] = Field(
         default_factory=lambda: ["floor"],
-        description="Capture channels this shim can offer. 'floor' is the "
-        "universal baseline; 'browser'/'desktop_ax' light up as their "
-        "enrichers land. Advertised to the platform so it can gate.",
+        description="Reserved design-preview capture channels. They are not "
+        "advertised until recording is production-ready end to end.",
+    )
+    recording_retention_limit: int = Field(
+        default=10,
+        ge=1,
+        description="Maximum number of finalized recordings retained for fetch/review.",
     )
 
     @property
@@ -219,6 +231,16 @@ class ShimConfig(BaseSettings):
         elif base.startswith("ws://"):
             base = "http://" + base[len("ws://") :]
         return base + "/api/oauth/token"
+
+    @property
+    def derived_oauth_revoke_url(self) -> str:
+        """Backend OAuth revocation endpoint."""
+        base = self.platform_url.rstrip("/")
+        if base.startswith("wss://"):
+            base = "https://" + base[len("wss://") :]
+        elif base.startswith("ws://"):
+            base = "http://" + base[len("ws://") :]
+        return base + "/api/oauth/revoke"
 
 
 def load_config(

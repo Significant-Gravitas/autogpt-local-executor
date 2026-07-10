@@ -7,7 +7,7 @@ On START_RECORDING the shim probes, in order:
      text → `extract_then_cloud` works.
   2. OCR available on-device → `extract_then_cloud` works even for `kind: none`
      (canvas/Electron) steps.
-  3. Capable local vision model present → offer `local_vlm` (zero cloud).
+  3. Capable local vision model present → offer `local_vlm` (pixels stay local).
   4. None of the above → `screenshots_to_cloud`, the ONLY route that prompts
      the user (§9.1).
 
@@ -35,8 +35,9 @@ _VLM_NAME_HINTS = ("llava", "bakllava", "llama3.2-vision", "qwen2-vl", "minicpm-
 @dataclass(frozen=True)
 class RouteDecision:
     """Result of probing. `requires_consent` is true ONLY for
-    screenshots_to_cloud (§3.1) — the other routes keep pixels local or send
-    text/structure, which is the same trust already extended."""
+    screenshots_to_cloud (§3.1) — the other routes keep pixels local. Every
+    route may still send the hygiene-redacted structured trajectory for
+    authenticated browser review."""
 
     route: InterpretationRoute
     requires_consent: bool
@@ -157,7 +158,7 @@ def probe_interpretation_route(
         return RouteDecision(
             route="local_vlm",
             requires_consent=False,
-            reason="capable local vision model present → zero-cloud local_vlm",
+            reason="capable local vision model present → pixel-local local_vlm",
         )
     return RouteDecision(
         route="screenshots_to_cloud",

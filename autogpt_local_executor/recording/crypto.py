@@ -8,9 +8,9 @@ uses when no keyring is available.
 
 The cipher itself is the stdlib-only HMAC-stream XOR used elsewhere in the shim
 (see audit.py): no extra deps, salt-per-blob, fine against a casual filesystem
-snoop. The strong privacy control is interpretation_route (pixels/raw values
-stay local), not this at-rest layer — this just keeps the buffer from sitting
-in plaintext between capture and skill-generation.
+snoop. The interpretation route controls whether pixels leave the machine;
+structured review data still crosses the shim boundary. This at-rest layer
+keeps the retained buffer from sitting in plaintext between capture and review.
 """
 
 from __future__ import annotations

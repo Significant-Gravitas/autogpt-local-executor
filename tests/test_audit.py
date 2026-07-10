@@ -221,6 +221,7 @@ async def test_env_values_never_leak_into_audit_log(tmp_path: Path) -> None:
         audit_log_path=tmp_path / "audit.log",
         platform_url="http://localhost:9999",
         machine_id="m",
+        enable_shell=True,
     )
     audit = AuditWriter(path=config.audit_log_path, audit_key=KEY)
     h = CommandHandler(config, audit=audit)

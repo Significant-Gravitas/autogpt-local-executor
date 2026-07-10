@@ -33,6 +33,13 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 #     but receivers MUST be lenient — HELLO-time negotiation is the truth.
 VERSION: str = "1.0"
 
+# The platform relay and shim both cap decoded WebSocket messages at 16 MiB.
+# JSON can expand a text byte to six bytes (for example NUL -> ``\u0000``),
+# so text-producing handlers retain a smaller payload with framing headroom.
+MAX_WEBSOCKET_MESSAGE_BYTES: int = 16 * 1024 * 1024
+MAX_WIRE_TEXT_CONTENT_BYTES: int = (MAX_WEBSOCKET_MESSAGE_BYTES - 64 * 1024) // 6
+MAX_WIRE_BASE64_CONTENT_BYTES: int = (MAX_WEBSOCKET_MESSAGE_BYTES - 64 * 1024) * 3 // 4
+
 
 def _split_version(v: str) -> tuple[int, int]:
     """Parse a "major.minor" string. Raises ValueError on malformed input.
@@ -240,7 +247,7 @@ RecordingMode = Literal["demonstration", "copilot"]
 # therefore the only one that needs the §9.1 consent prompt.
 InterpretationRoute = Literal[
     "extract_then_cloud",  # default — text/structure only leaves the machine
-    "local_vlm",  # zero-cloud upgrade; a local VLM authors the skill
+    "local_vlm",  # pixel-local upgrade; structured browser review still occurs
     "screenshots_to_cloud",  # fallback; gated on the shim-enforced consent
 ]
 
@@ -286,9 +293,9 @@ class HelloPayload(_Payload):
 class HelloAckPayload(_Payload):
     session_id: str
     granted_capabilities: list[str]
-    max_file_size_bytes: int = 10 * 1024 * 1024
-    command_timeout_seconds: int = 30
-    max_concurrent: int = 4
+    max_file_size_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    command_timeout_seconds: int = Field(default=30, gt=0)
+    max_concurrent: int = Field(default=4, gt=0)
     # Highest wire-protocol version this platform supports. "major.minor".
     # Effective negotiated version = same major, min(shim_minor, plat_minor).
     protocol_version: str = VERSION
@@ -299,7 +306,7 @@ class ExecuteCommandPayload(_Payload):
     argv: list[str] | None = None
     shell: Shell = Shell.AUTO
     cwd: str | None = None
-    timeout_seconds: int | None = None
+    timeout_seconds: int | None = Field(default=None, gt=0)
     env: dict[str, str] = Field(default_factory=dict)
 
 
@@ -309,14 +316,15 @@ class CommandResultPayload(_Payload):
     exit_code: int
     timed_out: bool
     duration_seconds: float
+    output_truncated: bool = False
 
 
 class FileReadPayload(_Payload):
     path: str
     encoding: Encoding = Encoding.UTF8
     format: FileFormat = FileFormat.TEXT
-    offset: int = 0
-    length: int | None = None
+    offset: int = Field(default=0, ge=0)
+    length: int | None = Field(default=None, gt=0)
 
 
 class FileContentsPayload(_Payload):

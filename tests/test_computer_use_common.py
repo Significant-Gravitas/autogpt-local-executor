@@ -17,6 +17,7 @@ from autogpt_local_executor.computer_use import (
     WindowStaleError,
 )
 from autogpt_local_executor.computer_use.backend import (
+    ClipboardReadResult,
     ScreenshotResult,
 )
 from autogpt_local_executor.computer_use.backends._common import (
@@ -442,6 +443,41 @@ async def test_clipboard_write_round_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_clipboard_read_rejects_oversized_result(tmp_path: Path) -> None:
+    handler = ComputerUseHandler(
+        make_config(tmp_path, enable_clipboard=True, max_file_size_bytes=4)
+    )
+    fb = attach_fake(handler)
+    fb.clipboard_read.return_value = ClipboardReadResult(
+        format="text", content="hello", size_bytes=5
+    )
+
+    response = await handler.handle(ClipboardReadMessage(id=new_id(), ts=now_ts()))
+
+    assert isinstance(response, ErrorMessage)
+    assert response.payload.code == ErrorCode.FILE_TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_clipboard_write_rejects_oversized_utf8_before_backend(tmp_path: Path) -> None:
+    handler = ComputerUseHandler(
+        make_config(tmp_path, enable_clipboard=True, max_file_size_bytes=4)
+    )
+    fb = attach_fake(handler)
+    message = ClipboardWriteMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=ClipboardWritePayload(content="ééé"),
+    )
+
+    response = await handler.handle(message)
+
+    assert isinstance(response, ErrorMessage)
+    assert response.payload.code == ErrorCode.FILE_TOO_LARGE
+    fb.clipboard_write.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_permissions_check_response(tmp_path: Path) -> None:
     handler = ComputerUseHandler(make_config(tmp_path))
     fb = attach_fake(handler)
@@ -488,3 +524,63 @@ async def test_screenshot_response_carries_origin_and_display_id(
     assert resp.payload.meta.origin == (100, 200)
     assert resp.payload.meta.display_id == 1
     assert resp.payload.region == (100, 200, 900, 700)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_rejects_oversized_bytes_before_base64(tmp_path: Path) -> None:
+    handler = ComputerUseHandler(make_config(tmp_path, max_file_size_bytes=3))
+    fb = attach_fake(handler)
+    fb.screenshot.return_value = ScreenshotResult(
+        image_bytes=b"four",
+        mime_type="image/png",
+        width=1,
+        height=1,
+        monitor=0,
+        region=None,
+        display_scale=1.0,
+        logical_size=(1, 1),
+        origin=(0, 0),
+        display_id=0,
+    )
+
+    response = await handler.handle(
+        ScreenshotRequestMessage(
+            id=new_id(),
+            ts=now_ts(),
+            payload=ScreenshotRequestPayload(),
+        )
+    )
+
+    assert isinstance(response, ErrorMessage)
+    assert response.payload.code == ErrorCode.FILE_TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_screenshot_rate_limit_rejects_excess_request(tmp_path: Path) -> None:
+    handler = ComputerUseHandler(make_config(tmp_path, max_screenshots_per_minute=1))
+    backend = attach_fake(handler)
+    backend.screenshot.return_value = ScreenshotResult(
+        image_bytes=b"img",
+        mime_type="image/jpeg",
+        width=1,
+        height=1,
+        monitor=0,
+        region=None,
+        display_scale=1.0,
+        logical_size=(1, 1),
+        origin=(0, 0),
+        display_id=0,
+    )
+    request = ScreenshotRequestMessage(
+        id=new_id(),
+        ts=now_ts(),
+        payload=ScreenshotRequestPayload(),
+    )
+
+    first = await handler.handle(request)
+    second = await handler.handle(request.model_copy(update={"id": new_id()}))
+
+    assert first.type == "SCREENSHOT_RESPONSE"
+    assert isinstance(second, ErrorMessage)
+    assert second.payload.code == ErrorCode.SHIM_OVERLOADED
+    backend.screenshot.assert_called_once()

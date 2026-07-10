@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,8 @@ import pytest
 from autogpt_local_executor.config import ShimConfig
 from autogpt_local_executor.handlers import CommandHandler, FileHandler
 from autogpt_local_executor.protocol import (
+    MAX_WEBSOCKET_MESSAGE_BYTES,
+    MAX_WIRE_TEXT_CONTENT_BYTES,
     AckMessage,
     CommandResultMessage,
     Encoding,
@@ -36,6 +39,7 @@ from autogpt_local_executor.protocol import (
     FileWriteMessage,
     FileWritePayload,
     Shell,
+    dump_message,
     new_id,
     now_ts,
 )
@@ -47,6 +51,7 @@ def make_config(tmp_path: Path) -> ShimConfig:
         audit_log_path=tmp_path / "_audit.log",
         platform_url="http://localhost:9999",
         machine_id="test-machine",
+        enable_shell=True,
     )
 
 
@@ -78,6 +83,38 @@ async def test_write_then_read_text(tmp_path: Path) -> None:
     assert isinstance(resp, FileContentsMessage)
     assert resp.payload.content == "hello"
     assert resp.payload.encoding == Encoding.UTF8
+
+
+@pytest.mark.asyncio
+async def test_read_small_range_from_file_larger_than_limit(tmp_path: Path) -> None:
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"0123456789")
+    config = make_config(tmp_path)
+    config.max_file_size_bytes = 4
+    handler = FileHandler(config)
+
+    response = await handler.handle_read(
+        _read_msg(path, offset=3, length=4, format=FileFormat.BYTES)
+    )
+
+    assert isinstance(response, FileContentsMessage)
+    assert base64.b64decode(response.payload.content) == b"3456"
+    assert response.payload.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_read_range_larger_than_limit_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"0123456789")
+    config = make_config(tmp_path)
+    config.max_file_size_bytes = 4
+
+    response = await FileHandler(config).handle_read(
+        _read_msg(path, offset=0, length=5, format=FileFormat.BYTES)
+    )
+
+    assert isinstance(response, ErrorMessage)
+    assert response.payload.code == ErrorCode.FILE_TOO_LARGE
 
 
 @pytest.mark.asyncio
@@ -401,6 +438,15 @@ def _cmd_msg(argv=None, command=None, **kw) -> ExecuteCommandMessage:
     )
 
 
+@pytest.mark.asyncio
+async def test_command_execution_is_disabled_by_default(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.enable_shell = False
+    response = await CommandHandler(config).handle(_cmd_msg(argv=["echo", "blocked"]))
+    assert isinstance(response, ErrorMessage)
+    assert response.payload.code == ErrorCode.CAPABILITY_NOT_GRANTED
+
+
 class _FakeProc:
     def __init__(self, *, stdout: bytes, stderr: bytes, returncode: int) -> None:
         self._stdout = stdout
@@ -436,6 +482,150 @@ async def test_command_argv_form_calls_create_subprocess_exec(tmp_path: Path) ->
     # First two args should be the binary and its first arg (we didn't pass through a shell).
     assert captured["args"][0] == "echo"
     assert captured["args"][1] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_command_output_is_drained_and_truncated_to_shared_limit(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.max_file_size_bytes = 1024
+    handler = CommandHandler(config)
+    command = "import os; os.write(1, b'o' * 100000); os.write(2, b'e' * 100000)"
+
+    response = await handler.handle(
+        _cmd_msg(
+            argv=[sys.executable, "-c", command],
+            cwd=str(tmp_path),
+            timeout_seconds=10,
+        )
+    )
+
+    assert isinstance(response, CommandResultMessage)
+    combined = (response.payload.stdout + response.payload.stderr).encode("utf-8")
+    assert len(combined) <= config.max_file_size_bytes
+    assert "[command output truncated]" in response.payload.stderr
+    assert response.payload.output_truncated is True
+    assert response.payload.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_command_output_is_safe_for_worst_case_json_escaping(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.max_file_size_bytes = MAX_WIRE_TEXT_CONTENT_BYTES + 1024
+    handler = CommandHandler(config)
+    fake = _FakeProc(
+        stdout=b"\0" * (MAX_WIRE_TEXT_CONTENT_BYTES + 1),
+        stderr=b"",
+        returncode=0,
+    )
+
+    with patch("asyncio.create_subprocess_exec", return_value=fake):
+        response = await handler.handle(_cmd_msg(argv=["emit-nuls"], cwd=str(tmp_path)))
+
+    assert isinstance(response, CommandResultMessage)
+    assert response.payload.output_truncated is True
+    assert len(dump_message(response).encode("utf-8")) <= MAX_WEBSOCKET_MESSAGE_BYTES
+
+
+@pytest.mark.asyncio
+async def test_requested_command_timeout_is_clamped_to_local_ceiling(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.command_timeout_seconds = 2
+    handler = CommandHandler(config)
+    fake = _FakeProc(stdout=b"", stderr=b"", returncode=0)
+    captured_timeout: float | None = None
+
+    async def collect(_proc, *, timeout: float):
+        nonlocal captured_timeout
+        captured_timeout = timeout
+        return b"", b"", False, False
+
+    with patch("asyncio.create_subprocess_exec", return_value=fake):
+        with patch.object(handler, "_collect_process_output", side_effect=collect):
+            response = await handler.handle(
+                _cmd_msg(argv=["slow"], cwd=str(tmp_path), timeout_seconds=300)
+            )
+
+    assert isinstance(response, CommandResultMessage)
+    assert captured_timeout == 2
+
+
+@pytest.mark.asyncio
+async def test_command_rate_limit_rejects_excess_request(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.max_commands_per_minute = 1
+    handler = CommandHandler(config)
+    fake = _FakeProc(stdout=b"", stderr=b"", returncode=0)
+
+    with patch("asyncio.create_subprocess_exec", return_value=fake):
+        first = await handler.handle(_cmd_msg(argv=["one"], cwd=str(tmp_path)))
+        second = await handler.handle(_cmd_msg(argv=["two"], cwd=str(tmp_path)))
+
+    assert isinstance(first, CommandResultMessage)
+    assert isinstance(second, ErrorMessage)
+    assert second.payload.code == ErrorCode.SHIM_OVERLOADED
+
+
+@pytest.mark.asyncio
+async def test_concurrent_command_limit_rejects_without_queueing(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.max_concurrent_commands = 1
+    handler = CommandHandler(config)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def execute(_msg):
+        entered.set()
+        await release.wait()
+        return CommandResultMessage(
+            id="first",
+            ts=now_ts(),
+            payload={
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0,
+                "timed_out": False,
+                "duration_seconds": 0,
+            },
+        )
+
+    with patch.object(handler, "_execute", side_effect=execute):
+        first_task = asyncio.create_task(handler.handle(_cmd_msg(argv=["one"])))
+        await entered.wait()
+        second = await handler.handle(_cmd_msg(argv=["two"]))
+        release.set()
+        await first_task
+
+    assert isinstance(second, ErrorMessage)
+    assert second.payload.code == ErrorCode.SHIM_OVERLOADED
+
+
+@pytest.mark.asyncio
+async def test_cancelling_command_handler_terminates_spawned_process(tmp_path: Path) -> None:
+    handler = CommandHandler(make_config(tmp_path))
+    fake = _FakeProc(stdout=b"", stderr=b"", returncode=0)
+    entered = asyncio.Event()
+    terminated = asyncio.Event()
+
+    async def collect(_proc, *, timeout: float):
+        entered.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def terminate(_proc):
+        terminated.set()
+
+    with patch("asyncio.create_subprocess_exec", return_value=fake):
+        with patch.object(handler, "_collect_process_output", side_effect=collect):
+            with patch.object(handler, "_terminate_tree", side_effect=terminate):
+                task = asyncio.create_task(
+                    handler.handle(_cmd_msg(argv=["long-running"], cwd=str(tmp_path)))
+                )
+                await entered.wait()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    assert terminated.is_set()
 
 
 @pytest.mark.asyncio

@@ -37,7 +37,7 @@ class KeychainTokenStore:
 
     async def get_access_token(self) -> str | None:
         """Return the stored access token, or None if not authenticated."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: keyring.get_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCESS_TOKEN_KEY),
@@ -45,7 +45,7 @@ class KeychainTokenStore:
 
     async def store_tokens(self, access_token: str, refresh_token: str) -> None:
         """Persist both tokens to the OS keychain."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
             lambda: keyring.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCESS_TOKEN_KEY, access_token),
@@ -69,7 +69,7 @@ class KeychainTokenStore:
             pass
 
     async def get_refresh_token(self) -> str | None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: keyring.get_password(KEYCHAIN_SERVICE, KEYCHAIN_REFRESH_TOKEN_KEY),
@@ -129,6 +129,35 @@ class OAuthFlow:
             tokens["access_token"],
             tokens.get("refresh_token", refresh),
         )
+
+    async def revoke_tokens(self) -> None:
+        """Revoke both token types remotely before deleting local credentials.
+
+        The desktop shim is a public client, so it sends the well-known client
+        id with an empty secret. Any HTTP or keychain read error aborts before
+        local deletion, leaving the credentials available for a retry.
+        """
+        access = await self.token_store.get_access_token()
+        refresh = await self.token_store.get_refresh_token()
+        tokens = (
+            (access, "access_token"),
+            (refresh, "refresh_token"),
+        )
+        async with httpx.AsyncClient() as client:
+            for token, token_type_hint in tokens:
+                if not token:
+                    continue
+                resp = await client.post(
+                    self.config.derived_oauth_revoke_url,
+                    json={
+                        "token": token,
+                        "token_type_hint": token_type_hint,
+                        "client_id": self.config.oauth_client_id,
+                        "client_secret": "",
+                    },
+                )
+                resp.raise_for_status()
+        self.token_store.clear_tokens()
 
     @staticmethod
     def _generate_pkce_pair() -> tuple[str, str]:

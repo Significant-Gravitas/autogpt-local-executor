@@ -21,6 +21,55 @@ from pathlib import Path
 
 
 def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    print("WARNING: This is experimental, untested software.")
+    print("   It can give the AutoGPT platform access to local files and optional capabilities.")
+    print("   Shell access, when explicitly enabled, is unrestricted at your user account level.")
+    print("   Read docs/SECURITY.md before continuing.\n")
+
+    # install / uninstall don't need a full config load — they only need the
+    # config path so the rendered autostart file points at the right file.
+    if args.command == "install":
+        _cmd_install(args)
+        return
+    if args.command == "uninstall":
+        _cmd_uninstall(args)
+        return
+
+    config = _build_config(args)
+
+    if args.command == "auth":
+        _cmd_auth(config)
+    elif args.command == "start":
+        exit_code = asyncio.run(_cmd_start(config))
+        if exit_code:
+            sys.exit(exit_code)
+    elif args.command == "status":
+        _cmd_status(config, args)
+    elif args.command == "revoke":
+        exit_code = asyncio.run(_cmd_revoke(config))
+        if exit_code:
+            sys.exit(exit_code)
+    elif args.command == "doctor":
+        from .doctor import run_doctor
+
+        sys.exit(run_doctor(config))
+    elif args.command == "audit":
+        exit_code = _cmd_audit(config, args)
+        if exit_code:
+            sys.exit(exit_code)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autogpt-shim",
         description="EXPERIMENTAL: AutoGPT Local PC Executor shim",
@@ -29,7 +78,7 @@ def main() -> None:
         "--allowed-root",
         type=Path,
         default=None,
-        help="Override the directory that all file ops are jailed to.",
+        help="Override the directory that FILE_* operations are jailed to.",
     )
     parser.add_argument(
         "--config",
@@ -43,6 +92,11 @@ def main() -> None:
         help="Base URL of the AutoGPT platform (default: https://platform.autogpt.net).",
     )
     parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Platform copilot session to attach to (required for start).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Python logging level (DEBUG/INFO/WARNING/ERROR).",
@@ -50,6 +104,18 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("auth", help="Authenticate with the AutoGPT platform (OAuth)")
     start_p = sub.add_parser("start", help="Start the shim daemon")
+    start_p.add_argument(
+        "--session-id",
+        dest="session_id",
+        default=argparse.SUPPRESS,
+        help="Platform copilot session to attach to (required; also accepted globally).",
+    )
+    start_p.add_argument(
+        "--enable-shell",
+        action="store_true",
+        default=False,
+        help="Enable unrestricted user-level shell execution. allowed_root does not sandbox it.",
+    )
     start_p.add_argument(
         "--enable-computer-use",
         action="store_true",
@@ -68,6 +134,12 @@ def main() -> None:
         default=False,
         help="With --enable-clipboard, also permit reading clipboard contents "
         "the shim didn't write (subject to ConcealedType / CF_PRIVATE).",
+    )
+    start_p.add_argument(
+        "--enable-recording",
+        action="store_true",
+        default=False,
+        help="Reserved design-preview flag; currently fails startup closed on every OS.",
     )
     sub.add_parser("status", help="Show connection + autostart status")
     sub.add_parser("revoke", help="Revoke tokens and disconnect")
@@ -115,48 +187,7 @@ def main() -> None:
         help="Threshold like `90d` or `30d`. Default 90d.",
     )
 
-    args = parser.parse_args()
-    logging.basicConfig(
-        level=args.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    print("WARNING: This is experimental, untested software.")
-    print("   It gives the AutoGPT platform code execution access to this machine.")
-    print("   Read docs/SECURITY.md before continuing.\n")
-
-    # install / uninstall don't need a full config load — they only need the
-    # config path so the rendered autostart file points at the right file.
-    if args.command == "install":
-        _cmd_install(args)
-        return
-    if args.command == "uninstall":
-        _cmd_uninstall(args)
-        return
-
-    config = _build_config(args)
-
-    if args.command == "auth":
-        _cmd_auth(config)
-    elif args.command == "start":
-        exit_code = asyncio.run(_cmd_start(config))
-        if exit_code:
-            sys.exit(exit_code)
-    elif args.command == "status":
-        _cmd_status(config, args)
-    elif args.command == "revoke":
-        _cmd_revoke()
-    elif args.command == "doctor":
-        from .doctor import run_doctor
-
-        sys.exit(run_doctor(config))
-    elif args.command == "audit":
-        exit_code = _cmd_audit(config, args)
-        if exit_code:
-            sys.exit(exit_code)
-    else:
-        parser.print_help()
-        sys.exit(1)
+    return parser
 
 
 def _build_config(args):
@@ -167,14 +198,20 @@ def _build_config(args):
         overrides["allowed_root"] = args.allowed_root
     if args.platform_url is not None:
         overrides["platform_url"] = args.platform_url
+    if args.session_id is not None:
+        overrides["session_id"] = args.session_id
     # Subcommand-specific flags (start) — argparse only sets them when
     # the corresponding subparser ran, so guard with hasattr.
     if getattr(args, "enable_computer_use", False):
         overrides["enable_computer_use"] = True
+    if getattr(args, "enable_shell", False):
+        overrides["enable_shell"] = True
     if getattr(args, "enable_clipboard", False):
         overrides["enable_clipboard"] = True
     if getattr(args, "enable_clipboard_read_foreign", False):
         overrides["enable_clipboard_read_foreign"] = True
+    if getattr(args, "enable_recording", False):
+        overrides["enable_recording"] = True
     return load_config(config_path=args.config, overrides=overrides)
 
 
@@ -187,21 +224,36 @@ def _cmd_auth(config) -> None:
 
 async def _cmd_start(config) -> int:
     from .auth import KeychainTokenStore
-    from .daemon import DaemonPreflightError, ShimDaemon
+    from .daemon import DaemonAuthenticationError, DaemonPreflightError, ShimDaemon
 
-    daemon = ShimDaemon(config=config, token_store=KeychainTokenStore())
+    if not config.session_id or not config.session_id.strip():
+        print(
+            "Start requires a nonempty session ID. Pass `--session-id <id>` before "
+            "the `start` command or set AUTOGPT_SHIM_SESSION_ID.",
+            flush=True,
+        )
+        return 2
+
     print(f"Starting shim daemon (machine_id={config.machine_id})")
     print(f"Allowed root: {config.allowed_root}")
+    if config.enable_shell:
+        print("WARNING: shell is enabled and can access anything your user account can access.")
     print("Press Ctrl+C to stop.\n")
+    daemon = None
     try:
+        daemon = ShimDaemon(config=config, token_store=KeychainTokenStore())
         await daemon.run()
     except DaemonPreflightError as exc:
         # Exit 78 (EX_CONFIG) so launchd's KeepAlive: SuccessfulExit=false
         # re-launches us on the next TCC change. See COMPUTER_USE.md Q5.
         print(f"Preflight failed: {exc}", flush=True)
         return 78
+    except DaemonAuthenticationError as exc:
+        print(f"Authentication failed: {exc}", flush=True)
+        return 77
     except KeyboardInterrupt:
-        await daemon.stop()
+        if daemon is not None:
+            await daemon.stop()
         print("\nShim stopped.")
     return 0
 
@@ -215,12 +267,21 @@ def _cmd_status(config, args) -> None:
     _print_autostart_status()
 
 
-def _cmd_revoke() -> None:
-    from .auth import KeychainTokenStore
+async def _cmd_revoke(config) -> int:
+    from .auth import KeychainTokenStore, OAuthFlow
 
     store = KeychainTokenStore()
-    store.clear_tokens()
+    flow = OAuthFlow(config=config, token_store=store)
+    try:
+        await flow.revoke_tokens()
+    except Exception as exc:
+        print(
+            "Token revocation did not complete; local credentials were left in place "
+            f"where possible so you can retry: {exc}"
+        )
+        return 1
     print("Tokens revoked. Run `autogpt-shim auth` to re-authenticate.")
+    return 0
 
 
 def _cmd_install(args) -> None:

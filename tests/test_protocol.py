@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from autogpt_local_executor.protocol import (
     VERSION,
+    CommandResultMessage,
     ErrorCode,
     ExecuteCommandMessage,
     FileReadMessage,
@@ -76,6 +77,77 @@ def test_parse_execute_command_with_argv() -> None:
     assert isinstance(msg, ExecuteCommandMessage)
     assert msg.payload.argv == ["ls", "-la"]
     assert msg.payload.command is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_file_size_bytes", 0),
+        ("max_file_size_bytes", -1),
+        ("command_timeout_seconds", 0),
+        ("command_timeout_seconds", -1),
+        ("max_concurrent", 0),
+        ("max_concurrent", -1),
+    ],
+)
+def test_parse_hello_ack_rejects_nonpositive_limits(field: str, value: int) -> None:
+    payload = {
+        "session_id": "s1",
+        "granted_capabilities": ["files"],
+        "max_file_size_bytes": 1024,
+        "command_timeout_seconds": 5,
+        "max_concurrent": 2,
+    }
+    payload[field] = value
+    raw = json.dumps(
+        {
+            "type": "HELLO_ACK",
+            "id": "abc",
+            "ts": 1.0,
+            "payload": payload,
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        parse_message(raw)
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_parse_execute_command_rejects_nonpositive_timeout(timeout: int) -> None:
+    raw = json.dumps(
+        {
+            "type": "EXECUTE_COMMAND",
+            "id": "abc",
+            "ts": 1.0,
+            "payload": {"argv": ["echo"], "timeout_seconds": timeout},
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        parse_message(raw)
+
+
+def test_command_result_round_trips_output_truncated() -> None:
+    raw = json.dumps(
+        {
+            "type": "COMMAND_RESULT",
+            "id": "abc",
+            "ts": 1.0,
+            "payload": {
+                "stdout": "partial",
+                "stderr": "",
+                "exit_code": 0,
+                "timed_out": False,
+                "duration_seconds": 0.1,
+                "output_truncated": True,
+            },
+        }
+    )
+
+    msg = parse_message(raw)
+
+    assert isinstance(msg, CommandResultMessage)
+    assert msg.payload.output_truncated is True
 
 
 def test_parse_file_read_format_text_default() -> None:

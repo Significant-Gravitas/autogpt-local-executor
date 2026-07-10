@@ -141,6 +141,25 @@ def _deny_consent(broker: ConsentBroker, *, mode: str, interpretation_route: str
     return None
 
 
+def test_production_capture_factory_wires_macos_input_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autogpt_local_executor import platform_info
+    from autogpt_local_executor.recording import A11yEnricher, ScreenshotActionFloor
+    from autogpt_local_executor.recording.macos_capture import MacInputCaptureSource
+
+    monkeypatch.setattr(platform_info, "detect_platform", lambda: "darwin")
+    monkeypatch.setattr(platform_info, "available_recording_channels", lambda: ["floor"])
+    monkeypatch.setattr(MacInputCaptureSource, "start", lambda self: True)
+    handler = RecordingHandler(_make_config(tmp_path), recording_cipher=_TEST_CIPHER)
+
+    source = handler._default_capture_factory(_make_session(tmp_path))
+
+    assert isinstance(source, A11yEnricher)
+    assert isinstance(source._floor, ScreenshotActionFloor)
+    assert isinstance(source._floor._input_events, MacInputCaptureSource)
+
+
 # ── Protocol round-trips (each new message type) ──────────────────────────────
 
 
@@ -346,6 +365,20 @@ def test_session_review_removes_and_redacts_authoritative_steps(tmp_path: Path) 
     assert recording.steps[0].value.raw is None
     assert recording.steps[0].value.type == "secret"
     assert recording.steps[0].redacted is True
+
+
+def test_session_exact_repeated_review_is_idempotent(tmp_path: Path) -> None:
+    sess = _make_session(tmp_path)
+    sess.start()
+    sess.append(_step(1, raw="hide"))
+    sess.append(_step(2, raw="remove"))
+    sess.stop()
+
+    first = sess.apply_review(removed_step_seqs=[2], redacted_step_seqs=[1])
+    second = sess.apply_review(removed_step_seqs=[2], redacted_step_seqs=[1])
+
+    assert first == second == 1
+    assert [step.seq for step in sess.to_recording().steps] == [1]
 
 
 def test_session_review_rejects_unknown_step(tmp_path: Path) -> None:
@@ -564,6 +597,7 @@ async def test_request_consent_denial_returns_no_token(tmp_path: Path) -> None:
         _make_config(tmp_path),
         consent_broker=ConsentBroker(),
         consent_prompt=_deny_consent,
+        capture_factory=_capture_factory([]),
         recording_cipher=_TEST_CIPHER,
     )
     request = RequestRecordingConsentMessage(
@@ -576,6 +610,61 @@ async def test_request_consent_denial_returns_no_token(tmp_path: Path) -> None:
     assert consent.payload.approved is False
     assert consent.payload.consent_token is None
     assert consent.payload.expires_at is None
+
+
+async def test_request_consent_rejects_unavailable_channel(tmp_path: Path) -> None:
+    prompted = False
+
+    def prompt(*_args, **_kwargs):
+        nonlocal prompted
+        prompted = True
+        return None
+
+    handler = RecordingHandler(
+        _make_config(tmp_path),
+        consent_prompt=prompt,
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
+    )
+    response = await handler.handle(
+        RequestRecordingConsentMessage(
+            id=new_id(),
+            ts=now_ts(),
+            payload=RequestRecordingConsentPayload(mode="copilot", channels=["browser"]),
+        ),
+        send=None,
+    )
+
+    assert isinstance(response, ErrorMessage)
+    assert response.payload.code == ErrorCode.RECORDING_CHANNEL_UNAVAILABLE
+    assert prompted is False
+
+
+async def test_handler_uses_daemon_local_model_list_for_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import autogpt_local_executor.recording.route as route_mod
+
+    monkeypatch.setattr(route_mod, "_ocr_available", lambda: False)
+    handler = RecordingHandler(
+        _make_config(tmp_path),
+        consent_prompt=_approve_consent,
+        capture_factory=_capture_factory([]),
+        recording_cipher=_TEST_CIPHER,
+    )
+    handler.set_local_llm_models(["llava:13b"])
+
+    response = await handler.handle(
+        RequestRecordingConsentMessage(
+            id=new_id(),
+            ts=now_ts(),
+            payload=RequestRecordingConsentPayload(mode="copilot", channels=["floor"]),
+        ),
+        send=None,
+    )
+
+    assert isinstance(response, RecordingConsentResultMessage)
+    assert response.payload.interpretation_route == "local_vlm"
 
 
 async def test_start_without_valid_token_returns_consent_required(tmp_path: Path) -> None:
@@ -885,6 +974,7 @@ async def test_handler_review_changes_later_fetch(tmp_path: Path) -> None:
 
 async def test_mock_capture_source_end_to_end(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
+    cfg.recording_channels = ["floor", "browser"]
     broker = ConsentBroker()
     # Scripted browser-form-fill: 2 dom fills (one a password) + a submit.
     steps = [
@@ -937,6 +1027,62 @@ async def test_mock_capture_source_end_to_end(tmp_path: Path) -> None:
     assert rec.steps[1].value.raw is None and rec.steps[1].redacted is True
     assert rec.steps[2].action == "submit"
     assert all(s.screenshot_ref for s in rec.steps)
+
+
+async def test_finalized_recordings_are_retained_by_id_with_bounded_eviction(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(tmp_path)
+    cfg.recording_retention_limit = 2
+    broker = ConsentBroker()
+    handler = RecordingHandler(
+        cfg,
+        consent_broker=broker,
+        capture_factory=_capture_factory([_step(1)]),
+        recording_cipher=_TEST_CIPHER,
+    )
+    recording_ids: list[str] = []
+
+    for _ in range(3):
+        started = await handler.handle(
+            StartRecordingMessage(
+                id=new_id(),
+                ts=now_ts(),
+                payload=StartRecordingPayload(
+                    mode="demonstration",
+                    channels=["floor"],
+                    consent_token=_consent(broker, mode="demonstration"),
+                ),
+            ),
+            send=None,
+        )
+        assert isinstance(started, RecordingStartedMessage)
+        recording_ids.append(started.payload.recording_id)
+        await handler.handle(
+            StopRecordingMessage(
+                id=new_id(),
+                ts=now_ts(),
+                payload=StopRecordingPayload(recording_id=started.payload.recording_id),
+            ),
+            send=None,
+        )
+
+    responses = []
+    for recording_id in recording_ids:
+        responses.append(
+            await handler.handle(
+                RecordingFetchMessage(
+                    id=new_id(),
+                    ts=now_ts(),
+                    payload=RecordingFetchPayload(recording_id=recording_id),
+                ),
+                send=None,
+            )
+        )
+
+    assert isinstance(responses[0], ErrorMessage)
+    assert responses[0].payload.code == ErrorCode.RECORDING_NOT_FOUND
+    assert all(isinstance(response, RecordingDataMessage) for response in responses[1:])
 
 
 async def test_stop_unknown_recording_returns_not_found(tmp_path: Path) -> None:

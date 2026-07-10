@@ -1,7 +1,7 @@
 # Workflow Recording → Skill
 
-> **Status**: v1 wire contract spec-locked (§1, §6); PM-strategy
-> questions resolved with v1 defaults (§0.1). Implementation in progress.
+> **Status**: design preview, disabled at runtime. The wire contract is drafted,
+> but capture and interpretation are incomplete end to end.
 >
 > Record a workflow the user performs **anywhere on their machine**, hand
 > it to the agent, and have the agent generalize it into a reusable
@@ -12,6 +12,13 @@
 > turns that into a skill that fills the same form from every row of a
 > CSV. The same machinery records a desktop app, a terminal sequence, or
 > a flow that spans a browser *and* a native app.
+
+**Current implementation boundary:** macOS capture code exists behind the
+`CaptureSource` seam, but the daemon intentionally advertises no recording
+channels on any OS. Setting `enable_recording=true` fails startup with
+`EX_CONFIG`. Windows/Linux capture, browser/desktop enrichment, and the full
+interpretation path remain incomplete. Everything below is a design contract,
+not an enabled product capability.
 
 ---
 
@@ -28,10 +35,10 @@ both as disqualifying. v0.2 re-founds the design:
    to understand and redo the task*. That makes the floor universal
    (works in any app on any OS where computer-use works), with DOM/a11y as
    **enrichment**, not requirements.
-2. **On-device interpretation is mandatory.** A general recording is
-   screenshots of the user's whole screen. Those never leave the machine
-   raw. The default path extracts structure on-device and sends only that
-   to the cloud (see §3).
+2. **Pixels stay local by default.** Raw screen frames leave the machine only
+   for the explicit `screenshots_to_cloud` route. Every route may send the
+   hygiene-redacted structured trajectory through the authenticated platform
+   to the user's browser for review (see §3 and §6).
 3. **Consent is shim-enforced, secret-detection is hygiene not a control,
    replay has explicit wait/assert/dedupe guards, and parameter inference
    must be confirmed (multi-row or asked), not guessed.** (Panel must-fixes,
@@ -76,8 +83,8 @@ To unblock the build, the §10 open questions take these v1 defaults
 The **wire contract (§1 schema, §6 ops + error codes) is spec-locked** —
 both repos build against it as-is. The build seam for the genuinely
 OS-specific part (raw input-event observation) is a `CaptureSource`
-interface with a mock producer for tests; real per-OS hooks land behind
-it without changing the contract.
+interface with a mock producer for tests. The macOS hook is wired; additional
+per-OS hooks land behind the same interface without changing the contract.
 
 ---
 
@@ -187,25 +194,29 @@ The user picks the mode per recording; the wire + schema are identical.
 
 ## 3. On-device interpretation (the privacy floor)
 
-A general recording contains screenshots of the user's whole screen.
-**Raw frames never leave the machine.** Interpretation — turning the
-trajectory into an abstract skill — happens under one of three routes,
-chosen per recording. The route is recorded in
+A general recording may contain screenshots of the user's screen. **Raw
+frames stay on the machine unless the user explicitly approves
+`screenshots_to_cloud`.** After STOP, however, the authenticated platform
+fetches the hygiene-redacted structured trajectory for browser review on every
+route. That trajectory can contain actions, coordinates, app/window metadata,
+and non-secret field values; secret detection is best-effort, not a guarantee.
+Interpretation happens under one of three routes, chosen per recording. The route is recorded in
 `recording.interpretation_route`.
 
 | Route | What leaves the machine | Capability | Privacy | Needs |
 |---|---|---|---|---|
-| `extract_then_cloud` **(default)** | text/structure only — OCR + a11y dump + DOM + window/app metadata per step; **no pixels, no raw secret values** | cloud-grade reasoning over extracted structure | high — pixels stay local | a local extractor (OCR is cheap; a11y/DOM already captured) |
-| `local_vlm` (upgrade) | nothing — a local vision model authors the skill on-device; only the finished abstract skill is sent | capped by the user's local VLM | maximal — zero pixels, zero raw values leave | a capable local vision model (llava-class+) |
-| `screenshots_to_cloud` (fallback) | screenshots, behind an explicit per-recording consent | maximal | lowest — frames leave the machine | nothing; gated on a hard consent the shim enforces |
+| `extract_then_cloud` **(default)** | hygiene-redacted structured trajectory (OCR/a11y/DOM/window metadata and potentially non-secret values); no pixels | cloud-grade reasoning over extracted structure | high — pixels stay local | a local extractor (OCR is cheap; a11y/DOM already captured) |
+| `local_vlm` (upgrade) | hygiene-redacted structured trajectory for authenticated browser review, then the abstract skill; no pixels | capped by the user's local VLM | highest pixel privacy; review data still crosses the shim boundary | a capable local vision model (llava-class+) |
+| `screenshots_to_cloud` (fallback) | structured trajectory plus screenshots, behind explicit per-recording consent | maximal | lowest — frames leave the machine | nothing; gated on a hard consent the shim enforces |
 
-**Default is `extract_then_cloud`** — it generalizes well *and* keeps
-pixels on the machine. This is the privacy-mode pattern (local model /
+**Default is `extract_then_cloud`** — it generalizes well and keeps pixels on
+the machine, while still sending extracted structure for review and reasoning. This is the privacy-mode pattern (local model /
 pipeline extracts structure, strong cloud model reasons over it) applied
 to screen recordings. The browser-DOM case is the happy path here: DOM is
 already text, so extraction is free and lossless.
 
-`local_vlm` is the zero-cloud upgrade for users with the hardware.
+`local_vlm` is the pixel-local upgrade for users with the hardware; the
+structured browser-review trajectory still crosses the shim boundary.
 `screenshots_to_cloud` exists so users with no local extractor at all
 aren't locked out — but it requires the shim-enforced consent gate (§9),
 not a platform flag.
@@ -239,11 +250,11 @@ handles it; ask only when raw screen images would leave the machine.
 
 All adapters emit `TrajectoryStep`s into the same recording.
 
-- **Screenshot+action floor (universal).** The shim's existing
+- **Screenshot+action floor (target universal; currently macOS).** The shim's existing
   computer-use backends, run in reverse: instead of injecting input, the
   shim observes the user's action and snapshots the pre-action frame +
-  cursor + active app/window. Works anywhere computer-use works
-  (macOS/Windows/Linux-X11). This is the floor every other adapter
+  cursor + active app/window. It is currently wired through Quartz on macOS;
+  Windows/Linux producers have not landed and are not advertised. This is the floor every other adapter
   enriches.
 - **Browser DOM enrichment (lights up first).** A companion extension
   (extends the existing claude-in-chrome channel) attaches selectors +
@@ -339,14 +350,15 @@ Same machinery, fidelity scales with what the app exposes.
 **`RECORDING_STEP` is an unsolicited, non-acked, out-of-band stream**
 (co-pilot mode only) — modeled like `STATUS`, **exempt from
 `max_concurrent` / in-flight accounting and idempotency/retry** (the
-panel's load-bearing protocol fix). Demonstration mode does **not**
-stream; it buffers locally and the platform pulls via `RECORDING_FETCH`
-after `STOP` + `APPLY_RECORDING_REVIEW` — which is also what makes the user's
-step removals and redactions authoritative before skill generation and keeps demonstration-mode
-data on the machine until the user consents to send it. (v0.1 contradicted
-itself by streaming *and* claiming local-until-approved; resolved: stream
-only in co-pilot mode, where live narration needs it and the user opted
-into a live loop.)
+panel's load-bearing protocol fix). Demonstration mode does **not** stream
+during capture. After `STOP`, the authenticated platform calls
+`RECORDING_FETCH` and returns the shim's hygiene-redacted structured trajectory
+to the user's browser for review. The browser then sends
+`APPLY_RECORDING_REVIEW`; the shim applies removals and redactions to its
+authoritative retained copy. Skill generation remains blocked until that apply
+succeeds. This is not an on-device-only review: the review gate controls
+generation, while raw pixels remain local unless the separate
+`screenshots_to_cloud` consent was granted.
 
 Co-pilot interpretation reuses `LOCAL_LLM_COMPLETION` for the on-device
 model; `INTERPRET_TURN` / `CLARIFY_PROMPT` / `DRY_RUN_REPLAY` as in v0.1
@@ -407,13 +419,16 @@ clarifying question or a second row.
   reused for `screenshots_to_cloud`.
 - **Scoped capture.** Browser enrichment is **origin/active-form
   allow-listed** — it attaches to steps on the demonstrated origin, not
-  every tab. The floor captures the active window only. No global
-  keystroke hook.
+  every tab. The current macOS floor uses a session-wide, listen-only Quartz
+  event tap while recording is active, observing mouse-down and key-down
+  events across the desktop. It emits coarse actions and coordinates, not raw
+  typed key content, and tears the tap down on STOP.
 - **Secret-detection is best-effort hygiene, explicitly NOT a privacy
   control.** Password fields / secret-shaped values are dropped, but the
   doc no longer claims "secrets never captured" as a guarantee — OTPs,
   account numbers, SSNs-in-generic-fields will slip a deny-list. The real
-  control is `interpretation_route` (§3): pixels + raw values stay local.
+  control is `interpretation_route` (§3): it controls pixel handling. The
+  hygiene-redacted structured trajectory is still fetched for browser review.
 - **Replay safety.** Every replayed step that mutates state gets a
   read-back `assert` (did the field hold the value? did the banner
   appear?); destructive sequences (`submit`) require a per-row **dedupe
@@ -422,8 +437,8 @@ clarifying question or a second row.
   `destructive: true` flag on the generated skill.
 - **At-rest.** The buffered recording is encrypted on disk under a
   **distinct** key in the OS keychain (not the audit-chain key — a
-  different trust boundary), secure-erased after skill generation unless
-  the user pins it.
+  different trust boundary). The shim retains a bounded number by recording
+  ID for fetch/review and best-effort secure-erases an evicted buffer.
 - **Audit.** The audit log records *that* a recording happened + the
   channels + step count + interpretation route — never content. (Open:
   whether compliance needs a content manifest for data-subject requests,
@@ -466,12 +481,13 @@ these exact words):
 > Worth knowing:
 > - The images show whatever was on your screen while recording —
 >   including anything else that was open. You decide what's visible.
-> - They're used to build your skill, not to train models.
+> - They're handled under your AutoGPT deployment's data and retention settings.
 > - It's the same trust you already place in AutoGPT to act on your
 >   computer, now with screen images for this one recording.
 >
-> Prefer to keep everything on your machine? Install a local model and
-> re-record — nothing leaves.
+> Prefer to keep screen images on your machine? Install a local model and
+> re-record. The structured trajectory will still appear in your authenticated
+> browser for review.
 >
 > [ Keep it on my machine ]   [ Send and build ]   ☐ Remember my choice
 > for recordings like this

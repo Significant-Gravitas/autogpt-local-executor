@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from autogpt_local_executor import doctor
+from autogpt_local_executor.audit import AuditWriter
 from autogpt_local_executor.config import ShimConfig
 
 
@@ -91,17 +92,22 @@ def test_doctor_wsl2_blocks_when_computer_use_on(tmp_path, monkeypatch) -> None:
 # ── Daemon TCC preflight (C2) ───────────────────────────────────────────
 
 
-def test_daemon_preflight_passes_when_computer_use_off(tmp_path) -> None:
+def _daemon(config: ShimConfig):
     from autogpt_local_executor.daemon import ShimDaemon
 
+    audit = AuditWriter(path=config.audit_log_path, audit_key=b"a" * 32)
+    return ShimDaemon(config=config, token_store=MagicMock(), audit=audit)
+
+
+@pytest.mark.asyncio
+async def test_daemon_preflight_passes_when_computer_use_off(tmp_path) -> None:
     config = _config(tmp_path, enable_computer_use=False)
-    d = ShimDaemon(config=config, token_store=MagicMock(), audit=None)
-    d._preflight_or_raise()  # should not raise
+    await _daemon(config)._preflight_or_raise()
 
 
-def test_daemon_preflight_raises_when_ax_denied_on_macos(tmp_path, monkeypatch) -> None:
+async def test_daemon_preflight_raises_when_ax_denied_on_macos(tmp_path, monkeypatch) -> None:
     """Q5: macOS + computer_use requested + AX denied → DaemonPreflightError."""
-    from autogpt_local_executor.daemon import DaemonPreflightError, ShimDaemon
+    from autogpt_local_executor.daemon import DaemonPreflightError
 
     monkeypatch.setattr(
         "autogpt_local_executor.daemon.platform_info.detect_platform",
@@ -113,14 +119,13 @@ def test_daemon_preflight_raises_when_ax_denied_on_macos(tmp_path, monkeypatch) 
     fake_appsvc.AXIsProcessTrusted = lambda: False
     monkeypatch.setitem(sys.modules, "ApplicationServices", fake_appsvc)
     config = _config(tmp_path, enable_computer_use=True)
-    d = ShimDaemon(config=config, token_store=MagicMock(), audit=None)
+    d = _daemon(config)
     with pytest.raises(DaemonPreflightError):
-        d._preflight_or_raise()
+        await d._preflight_or_raise()
+    assert '"op": "DAEMON_PREFLIGHT_FAILED"' in config.audit_log_path.read_text()
 
 
-def test_daemon_preflight_passes_when_ax_granted_on_macos(tmp_path, monkeypatch) -> None:
-    from autogpt_local_executor.daemon import ShimDaemon
-
+async def test_daemon_preflight_passes_when_ax_granted_on_macos(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         "autogpt_local_executor.daemon.platform_info.detect_platform",
         lambda: "darwin",
@@ -131,19 +136,55 @@ def test_daemon_preflight_passes_when_ax_granted_on_macos(tmp_path, monkeypatch)
     fake_appsvc.AXIsProcessTrusted = lambda: True
     monkeypatch.setitem(sys.modules, "ApplicationServices", fake_appsvc)
     config = _config(tmp_path, enable_computer_use=True)
-    d = ShimDaemon(config=config, token_store=MagicMock(), audit=None)
-    d._preflight_or_raise()
+    await _daemon(config)._preflight_or_raise()
 
 
-def test_daemon_preflight_no_op_on_non_macos(tmp_path, monkeypatch) -> None:
+async def test_daemon_preflight_no_op_on_non_macos(tmp_path, monkeypatch) -> None:
     """Per Q5, the AX gate only applies to macOS — Windows/Linux are
     handled by their own permission models."""
-    from autogpt_local_executor.daemon import ShimDaemon
-
     monkeypatch.setattr(
         "autogpt_local_executor.daemon.platform_info.detect_platform",
         lambda: "linux",
     )
     config = _config(tmp_path, enable_computer_use=True)
-    d = ShimDaemon(config=config, token_store=MagicMock(), audit=None)
-    d._preflight_or_raise()  # no raise
+    await _daemon(config)._preflight_or_raise()
+
+
+@pytest.mark.asyncio
+async def test_daemon_preflight_fails_closed_when_ax_probe_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from autogpt_local_executor.daemon import DaemonPreflightError
+
+    monkeypatch.setattr(
+        "autogpt_local_executor.daemon.platform_info.detect_platform",
+        lambda: "darwin",
+    )
+    monkeypatch.setitem(sys.modules, "ApplicationServices", None)
+    config = _config(tmp_path, enable_computer_use=True)
+
+    with pytest.raises(DaemonPreflightError, match="Cannot verify Accessibility"):
+        await _daemon(config)._preflight_or_raise()
+
+
+@pytest.mark.asyncio
+async def test_daemon_preflight_fails_closed_when_ax_probe_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from autogpt_local_executor.daemon import DaemonPreflightError
+
+    monkeypatch.setattr(
+        "autogpt_local_executor.daemon.platform_info.detect_platform",
+        lambda: "darwin",
+    )
+    fake_appsvc = MagicMock()
+    fake_appsvc.AXIsProcessTrusted.side_effect = RuntimeError("TCC unavailable")
+    monkeypatch.setitem(sys.modules, "ApplicationServices", fake_appsvc)
+    config = _config(tmp_path, enable_computer_use=True)
+
+    with pytest.raises(DaemonPreflightError, match="Could not verify Accessibility"):
+        await _daemon(config)._preflight_or_raise()

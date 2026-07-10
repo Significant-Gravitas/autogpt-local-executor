@@ -466,11 +466,12 @@ async def test_audit_records_error_codes(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_build_hello_populates_models_when_probe_succeeds(tmp_path: Path) -> None:
     """Verifies daemon._build_hello probes Ollama and populates HELLO."""
+    from autogpt_local_executor.audit import AuditWriter
     from autogpt_local_executor.daemon import ShimDaemon
 
     cfg = make_config(tmp_path)
-    # No keychain hit — bypass with audit=None.
-    daemon = ShimDaemon(cfg, audit=None)
+    audit = AuditWriter(path=cfg.audit_log_path, audit_key=b"a" * 32)
+    daemon = ShimDaemon(cfg, token_store=object(), audit=audit)
     # Replace the handler's backend with one that returns 2 models.
     backend = MagicMock(spec=OllamaBackend)
     backend.list_models = AsyncMock(return_value=["llama3.2:3b", "mistral:7b"])
@@ -483,10 +484,12 @@ async def test_build_hello_populates_models_when_probe_succeeds(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_build_hello_strips_capability_when_probe_returns_empty(tmp_path: Path) -> None:
+    from autogpt_local_executor.audit import AuditWriter
     from autogpt_local_executor.daemon import ShimDaemon
 
     cfg = make_config(tmp_path)
-    daemon = ShimDaemon(cfg, audit=None)
+    audit = AuditWriter(path=cfg.audit_log_path, audit_key=b"a" * 32)
+    daemon = ShimDaemon(cfg, token_store=object(), audit=audit)
     backend = MagicMock(spec=OllamaBackend)
     backend.list_models = AsyncMock(
         side_effect=OllamaBackendError(ErrorCode.LOCAL_LLM_FAILED, "connection refused")

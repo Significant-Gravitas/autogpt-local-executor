@@ -12,7 +12,8 @@ One session per recording. Responsibilities (docs/WORKFLOW_RECORDING.md):
 - §9 redaction: best-effort HYGIENE — secret-shaped fields get
   value.raw=null / value.type=secret. THIS IS NOT A PRIVACY GUARANTEE. OTPs,
   account numbers, SSNs-in-generic-fields will slip the deny-list. The real
-  control is interpretation_route (pixels + raw values stay local). Named as
+  control is interpretation_route for pixel handling; the hygiene-redacted
+  structured trajectory is fetched for authenticated browser review. Named as
   hygiene in code + docstrings on purpose.
 - §9 at-rest: the buffer is encrypted on disk under a key DISTINCT from the
   audit-chain key (a different trust boundary), secure-erased on close unless
@@ -147,6 +148,8 @@ class RecordingSession:
         # On-disk encrypted buffer path. Unique per session; never reused.
         self._buffer_path = self._buffer_dir / f"{self.recording_id}.{secrets.token_hex(8)}.enc"
         self._closed = False
+        self._last_review_signature: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self._last_review_step_count: int | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -233,6 +236,11 @@ class RecordingSession:
         if self._stopped_at is None:
             raise RecordingError("recording must be stopped before review")
 
+        signature = (tuple(removed_step_seqs), tuple(redacted_step_seqs))
+        if signature == self._last_review_signature:
+            assert self._last_review_step_count is not None
+            return self._last_review_step_count
+
         known = {step.seq for step in self._steps}
         requested = set(removed_step_seqs) | set(redacted_step_seqs)
         unknown = requested - known
@@ -259,7 +267,9 @@ class RecordingSession:
             reviewed.append(step)
         self._steps = reviewed
         self._persist_buffer()
-        return len(self._steps)
+        self._last_review_signature = signature
+        self._last_review_step_count = len(self._steps)
+        return self._last_review_step_count
 
     def enrichment_coverage(self) -> EnrichmentCoverage:
         """Per-kind step counts for the summary (§6)."""

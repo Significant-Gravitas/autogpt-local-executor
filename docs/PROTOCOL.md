@@ -6,6 +6,11 @@
 
 - **Protocol**: WebSocket over TLS (`wss://`)
 - **Endpoint**: `wss://platform.autogpt.net/ws/local-executor/{session_id}`
+- **Session binding**: the shim requires an explicit, nonempty `session_id` at
+  startup; it never falls back to a shared `default` session.
+- **Frame limit**: the shim accepts WebSocket messages up to 16 MiB, matching
+  the platform relay/Uvicorn envelope cap. Per-operation payload limits remain
+  the lower negotiated `HELLO_ACK.max_file_size_bytes` value.
 - **Direction**: Outbound from shim (NAT/firewall friendly — no inbound ports needed)
 - **Auth**: Bearer token in `Authorization` header on WebSocket upgrade request
 
@@ -86,7 +91,7 @@ on the platform side, the session SHOULD be torn down with code 4426).
     "arch": "arm64",               // "x86_64" | "arm64" (normalized; see below)
     "screen_resolution": [2560, 1440],   // null if computer_use not available
     "capabilities": [
-      "shell",                     // always present
+      "shell",                     // optional: explicit local --enable-shell opt-in
       "files",                     // always present
       "computer_use",              // optional: pyautogui available
       "local_llm",                 // optional: ollama running
@@ -103,6 +108,10 @@ on the platform side, the session SHOULD be torn down with code 4426).
   }
 }
 ```
+
+`recording` message types are reserved design-preview protocol. The shim never
+advertises the `recording` capability, and startup fails closed if its preview
+flag is enabled, until capture and interpretation are complete end to end.
 
 #### `HELLO_ACK` (platform → shim)
 ```json
@@ -129,6 +138,13 @@ The effective negotiated wire-protocol version is computed per
 `max_concurrent` sizes the shim-side request semaphore. The shim must
 refuse (with `SHIM_OVERLOADED`) any request that arrives while the
 semaphore is at its cap. Default 4 if platform omits the field.
+All three limits must be positive. The shim applies the lower of its local
+configuration and the value in `HELLO_ACK`, so the platform can reduce a
+ceiling but cannot expand access beyond the user's local policy.
+
+The ACK must carry the same message ID as `HELLO`, the same session ID selected
+at startup, and only capabilities advertised by the shim. The shim rejects a
+mismatch and enforces the granted subset on every subsequent request.
 
 #### `HELLO.platform` enum
 
@@ -158,6 +174,13 @@ reject the HELLO with `UNSUPPORTED_ARCH`.
 ---
 
 ### Shell Execution
+
+The shim disables this capability by default. It is advertised and accepted
+only after the local user starts the daemon with `--enable-shell` (or the
+equivalent config setting). Both `command` and direct `argv` execution run with
+the shim user's normal OS permissions. `allowed_root` constrains `FILE_*`
+operations and the subprocess working directory; it does not sandbox what the
+process can access.
 
 #### `EXECUTE_COMMAND` (platform → shim)
 ```json
@@ -222,10 +245,18 @@ semantics.
     "stderr": "",
     "exit_code": 0,
     "timed_out": false,
-    "duration_seconds": 0.12
+    "duration_seconds": 0.12,
+    "output_truncated": false
   }
 }
 ```
+
+The shim drains stdout and stderr concurrently and retains at most
+`HELLO_ACK.max_file_size_bytes` across both fields. If output exceeds that
+shared budget, it continues draining to avoid subprocess deadlock and appends
+`[command output truncated]` to `stderr` inside the same byte budget, with
+`output_truncated: true`. The retained text is also capped below the 16 MiB
+transport ceiling to account for worst-case JSON escaping.
 
 ---
 
@@ -246,6 +277,11 @@ semantics.
   }
 }
 ```
+
+`offset` and `length` are byte-based. A bounded range may be read from a file
+larger than `max_file_size_bytes`; the shim seeks and reads only that range.
+Whole-file reads and requested ranges larger than the effective limit return
+`FILE_TOO_LARGE`.
 
 **`encoding` ↔ `format` mapping**: the wire keeps `encoding` for backward
 compatibility, but the Python adapter on the platform side accepts E2B's
@@ -613,6 +649,11 @@ are display-global, unscaled, top-left-origin pixels — same as
 }
 ```
 
+The shim checks raw screenshot bytes against
+`HELLO_ACK.max_file_size_bytes` before base64 encoding. Oversized captures
+return `FILE_TOO_LARGE` instead of building an envelope that exceeds the relay
+limit.
+
 #### `INPUT_ACTION` (platform → shim)
 ```json
 {
@@ -699,7 +740,7 @@ Error codes:
 - `AUTH_FAILED` — token invalid or expired
 - `SHIM_OVERLOADED` — too many concurrent requests (exceeded `max_concurrent`)
 - `INTERNAL_ERROR` — unexpected shim error
-- `FILE_TOO_LARGE` — FILE_READ / FILE_WRITE exceeded
+- `FILE_TOO_LARGE` — file, screenshot, clipboard, or command output exceeded
   `HELLO_ACK.max_file_size_bytes`
 - `DEPENDENCY_MISSING` — a runtime dep needed for the op (pyautogui,
   Pillow, xclip, etc.) isn't installed on the shim host
@@ -816,7 +857,8 @@ minor extension); the spec table above is the v1.0 set.
 Codes below 4426 follow IETF/RFC semantics (1000 normal, 1011 server
 error, etc.) and the shim DOES auto-reconnect with exponential backoff —
 only the application-layer codes in the table above are treated as fatal
-"do not retry without operator action".
+"do not retry without operator action". Unexpected clean closes still wait
+for the base backoff before reconnecting, preventing a hot loop.
 
 > The platform-side `ShimConnectionManager` change that actually emits
 > `SESSION_REVOKED` and close-code 4427 lives in a separate ticket; this
@@ -887,7 +929,7 @@ All shim-→-platform response envelopes carry a top-level
 `ts` / `version`). Value:
 
 ```
-pending_capacity = max_concurrent - in_flight_after_this_response
+pending_capacity = max_concurrent - admitted_or_in_flight_after_this_response
 ```
 
 i.e. free slots immediately AFTER this response is sent (we've already

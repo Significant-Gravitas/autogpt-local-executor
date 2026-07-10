@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -36,6 +37,8 @@ from .computer_use import (
 from .config import ShimConfig
 from .path_jail import PathJailError, assert_inside_jail
 from .protocol import (
+    MAX_WIRE_BASE64_CONTENT_BYTES,
+    MAX_WIRE_TEXT_CONTENT_BYTES,
     AckMessage,
     AckPayload,
     AppLaunchMessage,
@@ -138,6 +141,56 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+class _SlidingWindowRateLimiter:
+    def __init__(self, limit: int, *, window_seconds: float = 60.0) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._events: deque[float] = deque()
+
+    def allow(self) -> bool:
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        while self._events and self._events[0] <= cutoff:
+            self._events.popleft()
+        if len(self._events) >= self.limit:
+            return False
+        self._events.append(now)
+        return True
+
+
+class _BoundedCombinedOutput:
+    """Retain a bounded stdout+stderr prefix while callers keep draining pipes."""
+
+    _TRUNCATION_MARKER = b"\n[command output truncated]\n"
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(limit, 0)
+        self.stdout = bytearray()
+        self.stderr = bytearray()
+        self.truncated = False
+
+    def feed(self, channel: Literal["stdout", "stderr"], chunk: bytes) -> None:
+        remaining = self.limit - len(self.stdout) - len(self.stderr)
+        kept = chunk[: max(remaining, 0)]
+        getattr(self, channel).extend(kept)
+        if len(kept) != len(chunk):
+            self.truncated = True
+
+    def finish(self) -> tuple[bytes, bytes, bool]:
+        if self.truncated and self.limit:
+            marker = self._TRUNCATION_MARKER[: self.limit]
+            excess = len(self.stdout) + len(self.stderr) + len(marker) - self.limit
+            if excess > 0:
+                trim_stdout = min(excess, len(self.stdout))
+                if trim_stdout:
+                    del self.stdout[-trim_stdout:]
+                    excess -= trim_stdout
+            if excess > 0:
+                del self.stderr[-min(excess, len(self.stderr)) :]
+            self.stderr.extend(marker)
+        return bytes(self.stdout), bytes(self.stderr), self.truncated
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -237,8 +290,47 @@ class CommandHandler:
     ) -> None:
         self.config = config
         self.audit = audit
+        self._command_rate = _SlidingWindowRateLimiter(config.max_commands_per_minute)
+        self._active_commands = 0
 
     async def handle(self, msg: ExecuteCommandMessage) -> CommandResultMessage | ErrorMessage:
+        if not self.config.enable_shell:
+            return make_error(
+                msg.id,
+                ErrorCode.CAPABILITY_NOT_GRANTED,
+                "Shell execution is disabled. Restart the shim with --enable-shell to opt in.",
+            )
+        if not self._command_rate.allow():
+            await self._audit(
+                msg.id,
+                msg.payload,
+                cwd=msg.payload.cwd or str(self.config.allowed_root),
+                result=_err_result(0, ErrorCode.SHIM_OVERLOADED.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.SHIM_OVERLOADED,
+                f"Command rate limit exceeded ({self.config.max_commands_per_minute}/minute).",
+            )
+        if self._active_commands >= self.config.max_concurrent_commands:
+            await self._audit(
+                msg.id,
+                msg.payload,
+                cwd=msg.payload.cwd or str(self.config.allowed_root),
+                result=_err_result(0, ErrorCode.SHIM_OVERLOADED.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.SHIM_OVERLOADED,
+                "Concurrent command limit exceeded.",
+            )
+        self._active_commands += 1
+        try:
+            return await self._execute(msg)
+        finally:
+            self._active_commands -= 1
+
+    async def _execute(self, msg: ExecuteCommandMessage) -> CommandResultMessage | ErrorMessage:
         payload = msg.payload
         start = time.monotonic()
 
@@ -260,7 +352,10 @@ class CommandHandler:
             await _audit_jail_violation(self.audit, "EXECUTE_COMMAND", cwd_str, exc)
             return _jail_error_to_message(msg.id, exc)
 
-        timeout = payload.timeout_seconds or self.config.command_timeout_seconds
+        timeout = min(
+            payload.timeout_seconds or self.config.command_timeout_seconds,
+            self.config.command_timeout_seconds,
+        )
         env = _merge_env(_safe_env_baseline(), payload.env or {})
         # Always force UTF-8 on Python subprocess output to keep stdout/stderr decodable.
         env["PYTHONIOENCODING"] = "utf-8"
@@ -275,9 +370,6 @@ class CommandHandler:
             # New session = new pgid so we can kill the whole tree.
             preexec_fn = os.setsid  # type: ignore[attr-defined]
 
-        timed_out = False
-        stdout_b: bytes = b""
-        stderr_b: bytes = b""
         exit_code = -1
 
         try:
@@ -338,17 +430,20 @@ class CommandHandler:
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
 
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            exit_code = proc.returncode if proc.returncode is not None else -1
-        except TimeoutError:
-            timed_out = True
+            stdout_b, stderr_b, timed_out, output_truncated = await self._collect_process_output(
+                proc,
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
             await self._terminate_tree(proc)
-            try:
-                # Drain any remaining output without blocking long.
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2.0)
-            except TimeoutError:
-                pass
-            exit_code = proc.returncode if proc.returncode is not None else -1
+            wait = getattr(proc, "wait", None)
+            if callable(wait):
+                try:
+                    await asyncio.wait_for(wait(), timeout=2.0)
+                except (TimeoutError, ProcessLookupError):
+                    pass
+            raise
+        exit_code = proc.returncode if proc.returncode is not None else -1
 
         elapsed_ms = _elapsed_ms(start)
         duration = elapsed_ms / 1000.0
@@ -357,6 +452,7 @@ class CommandHandler:
             result = _err_result(elapsed_ms, ErrorCode.COMMAND_TIMEOUT.value, exit_code=exit_code)
         else:
             result = _ok_result(elapsed_ms, exit_code=exit_code)
+        result["output_truncated"] = output_truncated
         await self._audit(msg.id, payload, cwd=str(cwd), result=result, env=env)
 
         return CommandResultMessage(
@@ -368,8 +464,77 @@ class CommandHandler:
                 exit_code=exit_code,
                 timed_out=timed_out,
                 duration_seconds=round(duration, 3),
+                output_truncated=output_truncated,
             ),
         )
+
+    async def _collect_process_output(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        timeout: float,
+    ) -> tuple[bytes, bytes, bool, bool]:
+        """Drain stdout/stderr concurrently while retaining a shared bounded prefix."""
+        output = _BoundedCombinedOutput(
+            min(self.config.max_file_size_bytes, MAX_WIRE_TEXT_CONTENT_BYTES)
+        )
+        stdout = getattr(proc, "stdout", None)
+        stderr = getattr(proc, "stderr", None)
+
+        # Lightweight process doubles use communicate(); real asyncio
+        # subprocesses expose StreamReaders and take the bounded drain path.
+        if not hasattr(stdout, "read") or not hasattr(stderr, "read"):
+            timed_out = False
+            stdout_b = stderr_b = b""
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except TimeoutError:
+                timed_out = True
+                await self._terminate_tree(proc)
+                try:
+                    stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+                except TimeoutError:
+                    pass
+            output.feed("stdout", stdout_b)
+            output.feed("stderr", stderr_b)
+            kept_stdout, kept_stderr, truncated = output.finish()
+            return kept_stdout, kept_stderr, timed_out, truncated
+
+        async def drain(channel: Literal["stdout", "stderr"], stream: Any) -> None:
+            while chunk := await stream.read(64 * 1024):
+                output.feed(channel, chunk)
+
+        drain_tasks = [
+            asyncio.create_task(drain("stdout", stdout)),
+            asyncio.create_task(drain("stderr", stderr)),
+        ]
+        timed_out = False
+        try:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except TimeoutError:
+                timed_out = True
+                await self._terminate_tree(proc)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except TimeoutError:
+                    pass
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*drain_tasks, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except TimeoutError:
+                for task in drain_tasks:
+                    task.cancel()
+                await asyncio.gather(*drain_tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in drain_tasks:
+                task.cancel()
+            await asyncio.gather(*drain_tasks, return_exceptions=True)
+            raise
+        kept_stdout, kept_stderr, truncated = output.finish()
+        return kept_stdout, kept_stderr, timed_out, truncated
 
     @staticmethod
     async def _spawn_argv(
@@ -393,6 +558,8 @@ class CommandHandler:
     @staticmethod
     async def _terminate_tree(proc: asyncio.subprocess.Process) -> None:
         """Graceful → forceful kill per CROSS_PLATFORM.md "Process control" row."""
+        if proc.returncode is not None:
+            return
         plat = platform_info.detect_platform()
         try:
             if plat == "windows":
@@ -442,7 +609,10 @@ class CommandHandler:
             "shell": payload.shell.value,
             "cwd": cwd,
             "env_keys": env_keys,
-            "timeout_seconds": payload.timeout_seconds or self.config.command_timeout_seconds,
+            "timeout_seconds": min(
+                payload.timeout_seconds or self.config.command_timeout_seconds,
+                self.config.command_timeout_seconds,
+            ),
         }
         try:
             await self.audit.write(
@@ -507,7 +677,15 @@ class FileHandler:
             )
 
         size = path.stat().st_size
-        if size > self.config.max_file_size_bytes:
+        text_mode = payload.format != FileFormat.BYTES and payload.encoding != Encoding.BASE64
+        response_limit = self.config.max_file_size_bytes
+        if text_mode:
+            response_limit = min(response_limit, MAX_WIRE_TEXT_CONTENT_BYTES)
+        else:
+            response_limit = min(response_limit, MAX_WIRE_BASE64_CONTENT_BYTES)
+        remaining = max(size - payload.offset, 0)
+        requested_size = payload.length if payload.length is not None else remaining
+        if requested_size > response_limit:
             await self._emit(
                 "FILE_READ",
                 msg.id,
@@ -517,15 +695,16 @@ class FileHandler:
             return make_error(
                 msg.id,
                 ErrorCode.FILE_TOO_LARGE,
-                f"{size} bytes exceeds limit {self.config.max_file_size_bytes}",
+                f"Requested read of {requested_size} bytes exceeds limit {response_limit}",
             )
 
-        offset = max(payload.offset, 0)
-        length = payload.length
-        raw = await asyncio.to_thread(path.read_bytes)
-        end = offset + length if length is not None else len(raw)
-        chunk = raw[offset:end]
-        truncated = length is not None and end < len(raw)
+        def read_chunk() -> bytes:
+            with path.open("rb") as file:
+                file.seek(payload.offset)
+                return file.read(requested_size)
+
+        chunk = await asyncio.to_thread(read_chunk)
+        truncated = payload.offset + len(chunk) < size
 
         # encoding ↔ format mapping per PROTOCOL.md FILE_READ table.
         if payload.format == FileFormat.BYTES or payload.encoding == Encoding.BASE64:
@@ -981,6 +1160,7 @@ class ComputerUseHandler:
         self.config = config
         self.audit = audit
         self._backend = backend  # lazily built when first needed
+        self._screenshot_rate = _SlidingWindowRateLimiter(config.max_screenshots_per_minute)
 
     @property
     def backend(self) -> ComputerUseBackend:
@@ -1059,6 +1239,23 @@ class ComputerUseHandler:
             "window_id": p.window_id,
             "format": p.format,
         }
+        screenshot_limit = min(
+            self.config.max_file_size_bytes,
+            MAX_WIRE_BASE64_CONTENT_BYTES,
+        )
+        if not self._screenshot_rate.allow():
+            await self._emit(
+                "SCREENSHOT_REQUEST",
+                msg.id,
+                {**details, "image_bytes_returned": 0},
+                _err_result(_elapsed_ms(start), ErrorCode.SHIM_OVERLOADED.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.SHIM_OVERLOADED,
+                "Screenshot rate limit exceeded "
+                f"({self.config.max_screenshots_per_minute}/minute).",
+            )
 
         # Legacy test compatibility: when the old module-level pyautogui
         # mock is in place, honor it instead of the backend so existing
@@ -1073,6 +1270,18 @@ class ComputerUseHandler:
                 img = _pyautogui.screenshot()
                 img.convert("RGB").save(buf, format="JPEG", quality=p.quality)
                 img_bytes = buf.getvalue()
+                if len(img_bytes) > screenshot_limit:
+                    await self._emit(
+                        "SCREENSHOT_REQUEST",
+                        msg.id,
+                        {**details, "image_bytes_returned": len(img_bytes)},
+                        _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value),
+                    )
+                    return make_error(
+                        msg.id,
+                        ErrorCode.FILE_TOO_LARGE,
+                        f"Screenshot is {len(img_bytes)} bytes; limit is {screenshot_limit} bytes.",
+                    )
                 await self._emit(
                     "SCREENSHOT_REQUEST",
                     msg.id,
@@ -1119,6 +1328,20 @@ class ComputerUseHandler:
                 _err_result(_elapsed_ms(start), ErrorCode.INTERNAL_ERROR.value),
             )
             return make_error(msg.id, ErrorCode.INTERNAL_ERROR, str(exc))
+
+        if len(result.image_bytes) > screenshot_limit:
+            await self._emit(
+                "SCREENSHOT_REQUEST",
+                msg.id,
+                {**details, "image_bytes_returned": len(result.image_bytes)},
+                _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.FILE_TOO_LARGE,
+                f"Screenshot is {len(result.image_bytes)} bytes; limit is "
+                f"{screenshot_limit} bytes.",
+            )
 
         await self._emit(
             "SCREENSHOT_REQUEST",
@@ -1389,6 +1612,27 @@ class ComputerUseHandler:
                 _err_result(_elapsed_ms(start), exc.code.value),
             )
             return self._to_wire_error(msg.id, exc)
+        clipboard_limit = min(
+            self.config.max_file_size_bytes,
+            (
+                MAX_WIRE_TEXT_CONTENT_BYTES
+                if result.format == "text"
+                else MAX_WIRE_BASE64_CONTENT_BYTES
+            ),
+        )
+        if result.size_bytes > clipboard_limit:
+            await self._emit(
+                "CLIPBOARD_READ",
+                msg.id,
+                {**details, "size_bytes": result.size_bytes},
+                _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.FILE_TOO_LARGE,
+                f"Clipboard content is {result.size_bytes} bytes; limit is "
+                f"{clipboard_limit} bytes.",
+            )
         await self._emit(
             "CLIPBOARD_READ",
             msg.id,
@@ -1410,7 +1654,21 @@ class ComputerUseHandler:
     async def _clipboard_write(self, msg: ClipboardWriteMessage) -> Any:
         start = time.monotonic()
         p = msg.payload
-        details = {"format": p.format, "size_bytes": len(p.content.encode("utf-8"))}
+        size_bytes = len(p.content.encode("utf-8"))
+        details = {"format": p.format, "size_bytes": size_bytes}
+        if size_bytes > self.config.max_file_size_bytes:
+            await self._emit(
+                "CLIPBOARD_WRITE",
+                msg.id,
+                details,
+                _err_result(_elapsed_ms(start), ErrorCode.FILE_TOO_LARGE.value),
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.FILE_TOO_LARGE,
+                f"Clipboard content is {size_bytes} bytes; limit is "
+                f"{self.config.max_file_size_bytes} bytes.",
+            )
         try:
             await asyncio.to_thread(
                 self.backend.clipboard_write, format=p.format, content=p.content
@@ -1895,9 +2153,22 @@ class RecordingHandler:
         # (+ a11y enricher) wrapping the computer-use backend. Tests inject a
         # scripted MockCaptureSource here.
         self._capture_factory = capture_factory or self._default_capture_factory
+        self._using_injected_capture = capture_factory is not None
         self._recording_cipher = recording_cipher
         self._consent_prompt = consent_prompt or request_user_consent
-        self._session: RecordingSession | None = None
+        initial_channels = (
+            list(config.recording_channels)
+            if self._using_injected_capture
+            else [
+                channel
+                for channel in config.recording_channels
+                if channel in set(platform_info.available_recording_channels())
+            ]
+        )
+        self._available_channels = list(dict.fromkeys(initial_channels))
+        self._local_llm_models: list[str] = []
+        self._sessions: OrderedDict[str, RecordingSession] = OrderedDict()
+        self._active_recording_id: str | None = None
         # The background task draining the CaptureSource (co-pilot streaming or
         # demonstration buffering).
         self._consume_task: asyncio.Task[None] | None = None
@@ -1905,21 +2176,45 @@ class RecordingHandler:
     # ── Capture wiring (the seam) ─────────────────────────────────────────
 
     def _default_capture_factory(self, session: RecordingSession) -> CaptureSource:
-        """Build the production capture chain: floor → a11y enricher.
+        """Build the production macOS chain: Quartz input tap → floor → a11y."""
+        if platform_info.detect_platform() != "darwin":
+            raise RecordingError("workflow recording has no native capture source on this OS")
+        try:
+            from .recording.macos_capture import MacInputCaptureSource
+        except ImportError as exc:
+            raise RecordingError("macOS recording dependencies are unavailable") from exc
 
-        The floor's input-event source is the genuinely OS-specific part and is
-        NOT available here — until a real per-OS input-hook producer lands, this
-        floor has no events to snapshot and the chain yields nothing. The
-        RecordingHandler still functions (start/stop/fetch); it just records an
-        empty trajectory. Tests inject a MockCaptureSource instead.
-        """
-        from .recording import MockCaptureSource
-
-        # TODO(os-native): replace MockCaptureSource([]) with the real OS
-        # input-hook CaptureSource (CGEventTap / SetWindowsHookEx / XRecord).
-        input_events: CaptureSource = MockCaptureSource([])
+        input_events = MacInputCaptureSource()
+        if not input_events.start():
+            raise RecordingError(
+                "macOS Input Monitoring permission is required for workflow recording"
+            )
         floor = ScreenshotActionFloor(input_events=input_events, config=self.config)
         return A11yEnricher(floor=floor)
+
+    def set_available_channels(self, channels: list[str]) -> None:
+        """Update channels from the daemon's authoritative HELLO probe."""
+        self._available_channels = list(dict.fromkeys(channels))
+
+    def set_local_llm_models(self, models: list[str]) -> None:
+        """Expose the daemon's successful Ollama probe to route selection."""
+        self._local_llm_models = list(dict.fromkeys(models))
+
+    def _validate_channels(self, msg_id: str, channels: list[str]) -> ErrorMessage | None:
+        requested = list(dict.fromkeys(channels))
+        available = set(self._available_channels)
+        unavailable = [channel for channel in requested if channel not in available]
+        if requested and not unavailable:
+            return None
+        return make_error(
+            msg_id,
+            ErrorCode.RECORDING_CHANNEL_UNAVAILABLE,
+            "Requested recording channels are unavailable on this shim.",
+            details={
+                "requested_channels": requested,
+                "available_channels": self._available_channels,
+            },
+        )
 
     # ── Dispatch ──────────────────────────────────────────────────────────
 
@@ -1948,6 +2243,9 @@ class RecordingHandler:
 
     async def _request_consent(self, msg: RequestRecordingConsentMessage) -> Any:
         p = msg.payload
+        channel_error = self._validate_channels(msg.id, list(p.channels))
+        if channel_error is not None:
+            return channel_error
         decision = probe_interpretation_route(
             channels=p.channels,
             local_llm_models=list(self._advertised_models()),
@@ -1977,13 +2275,17 @@ class RecordingHandler:
     async def _start(self, msg: StartRecordingMessage, *, send: Any | None) -> Any:
         p = msg.payload
 
+        channel_error = self._validate_channels(msg.id, list(p.channels))
+        if channel_error is not None:
+            return channel_error
+
         # One-at-a-time. A START while a session is live → RECORDING_ALREADY_ACTIVE.
-        if self._session is not None and self._session.is_active:
+        if self._active_recording_id is not None:
             return make_error(
                 msg.id,
                 ErrorCode.RECORDING_ALREADY_ACTIVE,
                 "A recording is already in progress.",
-                details={"recording_id": self._session.recording_id},
+                details={"recording_id": self._active_recording_id},
             )
 
         # Consent: the token must be a valid, shim-issued, single-use token.
@@ -2018,8 +2320,20 @@ class RecordingHandler:
             buffer_dir=self.config.derived_recording_buffer_dir,
             cipher=self._recording_cipher,
         )
+        try:
+            source = self._capture_factory(session)
+        except Exception as exc:
+            logger.warning("Could not start recording capture: %s", exc)
+            return make_error(
+                msg.id,
+                ErrorCode.RECORDING_CHANNEL_UNAVAILABLE,
+                f"Could not start recording capture: {exc}",
+                details={"available_channels": self._available_channels},
+            )
         session.start()
-        self._session = session
+        self._sessions[session.recording_id] = session
+        self._active_recording_id = session.recording_id
+        self._prune_recordings()
 
         await self._audit_lifecycle("RECORDING_STARTED", session)
 
@@ -2027,7 +2341,12 @@ class RecordingHandler:
         # buffers silently.
         stream = p.mode == "copilot"
         self._consume_task = asyncio.create_task(
-            self._consume(session, send=send if stream else None, stream=stream)
+            self._consume(
+                session,
+                source=source,
+                send=send if stream else None,
+                stream=stream,
+            )
         )
 
         return RecordingStartedMessage(
@@ -2037,17 +2356,21 @@ class RecordingHandler:
         )
 
     def _advertised_models(self) -> list[str]:
-        """Local LLM model list for the route probe — empty when unknown.
+        return list(self._local_llm_models)
 
-        The daemon owns the authoritative probed list; here we stay decoupled
-        and let an empty list mean 'no local VLM' (the conservative default).
-        """
-        return []
+    def _prune_recordings(self) -> None:
+        while len(self._sessions) > self.config.recording_retention_limit:
+            recording_id, session = self._sessions.popitem(last=False)
+            if recording_id == self._active_recording_id:
+                self._sessions[recording_id] = session
+                break
+            session.close()
 
     async def _consume(
         self,
         session: RecordingSession,
         *,
+        source: CaptureSource,
         send: Any | None,
         stream: bool,
     ) -> None:
@@ -2059,7 +2382,6 @@ class RecordingHandler:
         demonstration mode the step is only buffered; the platform fetches
         after STOP + approval.
         """
-        source = self._capture_factory(session)
         try:
             async for step in source.steps():
                 session.append(step)
@@ -2084,8 +2406,12 @@ class RecordingHandler:
     # ── STOP ──────────────────────────────────────────────────────────────
 
     async def _stop(self, msg: StopRecordingMessage) -> Any:
-        session = self._session
-        if session is None or session.recording_id != msg.payload.recording_id:
+        session = self._sessions.get(msg.payload.recording_id)
+        if (
+            session is None
+            or self._active_recording_id != msg.payload.recording_id
+            or not session.is_active
+        ):
             return make_error(
                 msg.id,
                 ErrorCode.RECORDING_NOT_FOUND,
@@ -2116,6 +2442,7 @@ class RecordingHandler:
             self._consume_task = None
 
         session.stop()
+        self._active_recording_id = None
         await self._audit_lifecycle("RECORDING_STOPPED", session)
 
         return RecordingSummaryMessage(
@@ -2132,8 +2459,8 @@ class RecordingHandler:
     # ── FETCH ─────────────────────────────────────────────────────────────
 
     async def _apply_review(self, msg: ApplyRecordingReviewMessage) -> Any:
-        session = self._session
-        if session is None or session.recording_id != msg.payload.recording_id:
+        session = self._sessions.get(msg.payload.recording_id)
+        if session is None:
             return make_error(
                 msg.id,
                 ErrorCode.RECORDING_NOT_FOUND,
@@ -2157,8 +2484,8 @@ class RecordingHandler:
         )
 
     async def _fetch(self, msg: RecordingFetchMessage) -> Any:
-        session = self._session
-        if session is None or session.recording_id != msg.payload.recording_id:
+        session = self._sessions.get(msg.payload.recording_id)
+        if session is None:
             return make_error(
                 msg.id,
                 ErrorCode.RECORDING_NOT_FOUND,

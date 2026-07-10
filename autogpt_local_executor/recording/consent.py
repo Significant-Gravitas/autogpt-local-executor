@@ -179,9 +179,16 @@ def request_user_consent(
         root.withdraw()
         root.attributes("-topmost", True)
         if interpretation_route == "screenshots_to_cloud":
-            detail = "Screenshots may be sent to AutoGPT to build the workflow."
+            detail = (
+                "After you stop, the structured trajectory and screenshots may be sent "
+                "to AutoGPT for browser review and skill generation."
+            )
         else:
-            detail = "Screenshots stay on this machine; extracted steps may be processed."
+            detail = (
+                "Screen pixels stay on this machine. After you stop, a hygiene-redacted "
+                "structured trajectory is sent through AutoGPT to your authenticated "
+                "browser for review."
+            )
         approved = messagebox.askyesno(
             "Allow AutoGPT workflow recording?",
             f"AutoGPT wants to start a {mode} recording.\n\n{detail}",

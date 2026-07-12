@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from autogpt_local_executor.protocol import (
     VERSION,
+    AttachSessionMessage,
     CommandResultMessage,
     ErrorCode,
     ExecuteCommandMessage,
@@ -55,6 +56,89 @@ def test_parse_hello_ack() -> None:
     assert isinstance(msg, HelloAckMessage)
     assert msg.payload.session_id == "s1"
     assert msg.payload.granted_capabilities == ["shell", "files"]
+
+
+def test_parse_control_directory_and_attach_messages() -> None:
+    listing = parse_message(
+        json.dumps(
+            {
+                "type": "DIRECTORY_LIST_REQUEST",
+                "id": "list",
+                "ts": 1.0,
+                "payload": {"browse_id": None, "directory_ref": None},
+            }
+        )
+    )
+    assert listing.type == MessageType.DIRECTORY_LIST_REQUEST
+
+    attach = parse_message(
+        json.dumps(
+            {
+                "type": "ATTACH_SESSION",
+                "id": "attach",
+                "ts": 1.0,
+                "payload": {
+                    "session_id": "session-1",
+                    "browse_id": "browse-1",
+                    "directory_ref": "ref-1",
+                    "expected_connection_id": "connection-1",
+                },
+            }
+        )
+    )
+    assert isinstance(attach, AttachSessionMessage)
+    assert attach.payload.expected_connection_id == "connection-1"
+
+
+def test_directory_list_request_rejects_partial_reference_pair() -> None:
+    with pytest.raises(ValidationError, match="both be null or both be set"):
+        parse_message(
+            json.dumps(
+                {
+                    "type": "DIRECTORY_LIST_REQUEST",
+                    "id": "list",
+                    "ts": 1.0,
+                    "payload": {"browse_id": "browse-1", "directory_ref": None},
+                }
+            )
+        )
+
+
+def test_directory_list_cursor_requires_reference_pair() -> None:
+    with pytest.raises(ValidationError, match="cursor requires"):
+        parse_message(
+            json.dumps(
+                {
+                    "type": "DIRECTORY_LIST_REQUEST",
+                    "id": "list",
+                    "ts": 1.0,
+                    "payload": {
+                        "browse_id": None,
+                        "directory_ref": None,
+                        "cursor": "next-page",
+                    },
+                }
+            )
+        )
+
+
+def test_attach_rejects_session_id_that_can_escape_url_path() -> None:
+    with pytest.raises(ValidationError):
+        parse_message(
+            json.dumps(
+                {
+                    "type": "ATTACH_SESSION",
+                    "id": "attach",
+                    "ts": 1.0,
+                    "payload": {
+                        "session_id": "../control?admin=true",
+                        "browse_id": "browse-1",
+                        "directory_ref": "ref-1",
+                        "expected_connection_id": None,
+                    },
+                }
+            )
+        )
 
 
 def test_parse_execute_command_with_argv() -> None:

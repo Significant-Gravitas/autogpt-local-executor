@@ -13,6 +13,7 @@ docs/CROSS_PLATFORM.md "Default allowed_root" and "Audit log location".
 
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -92,13 +93,19 @@ class ShimConfig(BaseSettings):
     # ── Session ────────────────────────────────────────────────────────────
     session_id: str | None = Field(
         default=None,
-        description="Platform copilot session to attach to. Required when starting the daemon.",
+        description="Legacy platform copilot session. Omit for persistent machine control mode.",
     )
 
     # ── Identity ───────────────────────────────────────────────────────────
     machine_id: str = Field(
         default_factory=lambda: platform_info.detect_machine_id(),
         description="Stable identifier for this machine.",
+    )
+    display_name: str = Field(
+        default_factory=socket.gethostname,
+        min_length=1,
+        max_length=128,
+        description="Human-readable machine label shown in remote folder pickers.",
     )
 
     # ── File jail / audit ──────────────────────────────────────────────────

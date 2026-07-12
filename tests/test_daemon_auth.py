@@ -61,8 +61,10 @@ def _install_auth_doubles(
 ) -> tuple[list[bool], _ScriptedConnect]:
     token_calls: list[bool] = []
 
-    async def get_token(*, refresh_on_fail: bool) -> str:
+    async def get_token(*, refresh_on_fail: bool, rejected_token: str | None = None) -> str:
         token_calls.append(refresh_on_fail)
+        if refresh_on_fail:
+            assert rejected_token == "stale"
         return "fresh" if refresh_on_fail else "stale"
 
     async def run_session(_ws: object) -> None:
@@ -180,11 +182,66 @@ async def test_forced_refresh_does_not_reuse_rejected_keychain_token(
     assert refreshed is True
 
 
-def test_connect_url_rejects_missing_or_blank_session(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_shared_refresh_lock_rotates_token_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autogpt_local_executor.auth import OAuthFlow
+
+    class Store:
+        access_token = "stale"
+
+        async def get_access_token(self) -> str:
+            return self.access_token
+
+    store = Store()
+    refresh_lock = daemon_module.asyncio.Lock()
+    config = ShimConfig(
+        session_id="session-1",
+        allowed_root=tmp_path,
+        audit_log_path=tmp_path / "audit.log",
+    )
+    first = ShimDaemon(
+        config.model_copy(deep=True),
+        token_store=store,
+        audit=MagicMock(),
+        token_refresh_lock=refresh_lock,
+    )
+    second = ShimDaemon(
+        config.model_copy(deep=True),
+        token_store=store,
+        audit=MagicMock(),
+        token_refresh_lock=refresh_lock,
+    )
+    refresh_calls = 0
+
+    async def refresh_token(_flow: OAuthFlow) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        await daemon_module.asyncio.sleep(0)
+        store.access_token = "fresh"
+
+    monkeypatch.setattr(OAuthFlow, "refresh_token", refresh_token)
+
+    tokens = await daemon_module.asyncio.gather(
+        first._get_access_token(
+            refresh_on_fail=True,
+            rejected_token="stale",
+        ),
+        second._get_access_token(
+            refresh_on_fail=True,
+            rejected_token="stale",
+        ),
+    )
+
+    assert tokens == ["fresh", "fresh"]
+    assert refresh_calls == 1
+
+
+def test_connect_url_without_session_uses_control_endpoint(tmp_path: Path) -> None:
     for session_id in (None, "", "   "):
         daemon = _daemon(tmp_path, session_id=session_id)
-        with pytest.raises(ValueError, match="nonempty session_id"):
-            daemon._connect_url()
+        assert daemon._connect_url().endswith("/ws/local-executor")
 
 
 def test_audit_initialization_failure_is_terminal(

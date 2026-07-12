@@ -541,6 +541,89 @@ def _xor_decrypt(passphrase: str, salt: bytes, ciphertext: bytes) -> bytes:
     return _xor_encrypt(passphrase, salt, ciphertext)
 
 
+class SessionAuditWriter:
+    """Bind every write to one session while sharing a single HMAC chain."""
+
+    def __init__(self, writer: AuditWriter, session_id: str) -> None:
+        if not session_id:
+            raise ValueError("session_id must be nonempty")
+        self.writer = writer
+        self.session_id = session_id
+
+    @property
+    def audit_key(self) -> bytes:
+        return self.writer.audit_key
+
+    def set_session_id(self, session_id: str | None) -> None:
+        if session_id != self.session_id:
+            raise ValueError("A session-bound audit writer cannot change sessions")
+
+    def set_machine_id(self, machine_id: str | None) -> None:
+        if machine_id is not None:
+            self.writer.set_machine_id(machine_id)
+
+    async def write(
+        self,
+        op: str,
+        *,
+        session_id: str | None = None,
+        machine_id: str | None = None,
+        request_id: str | None,
+        details: dict[str, Any],
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        if session_id is not None and session_id != self.session_id:
+            raise ValueError("Audit write attempted to cross session boundary")
+        await self.writer.write(
+            op,
+            session_id=self.session_id,
+            machine_id=machine_id,
+            request_id=request_id,
+            details=details,
+            result=result,
+        )
+
+    async def shim_start(self, machine_id: str) -> None:
+        await self.write(
+            "SHIM_START",
+            machine_id=machine_id,
+            request_id=None,
+            details={"shim_version": self.writer._shim_version},
+        )
+
+    async def shim_stop(self, reason: str = "graceful") -> None:
+        await self.write("SHIM_STOP", request_id=None, details={"reason": reason})
+
+    async def ws_connected(self, url: str) -> None:
+        await self.write("WS_CONNECTED", request_id=None, details={"url": url})
+
+    async def ws_disconnected(self, reason: str) -> None:
+        await self.write("WS_DISCONNECTED", request_id=None, details={"reason": reason})
+
+    async def token_refreshed(self) -> None:
+        await self.write("TOKEN_REFRESHED", request_id=None, details={})
+
+    async def config_reloaded(self, granted_capabilities: list[str]) -> None:
+        await self.write(
+            "CONFIG_RELOADED",
+            request_id=None,
+            details={"granted_capabilities": granted_capabilities},
+        )
+
+    async def jail_violation(self, code: str, path: str, op: str | None = None) -> None:
+        await self.write(
+            "JAIL_VIOLATION",
+            request_id=None,
+            details={"code": code, "path": path, "attempted_op": op},
+            result={
+                "ok": False,
+                "exit_code": None,
+                "duration_ms": 0,
+                "error_code": code,
+            },
+        )
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -616,6 +699,7 @@ __all__ = [
     "ROTATE_MAX_AGE_SECONDS",
     "ROTATE_MAX_BYTES",
     "Violation",
+    "SessionAuditWriter",
     "canonical_bytes",
     "get_or_create_audit_key",
     "list_rotated_files",

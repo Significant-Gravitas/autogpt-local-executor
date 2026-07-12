@@ -13,7 +13,7 @@
 A daemon you install on your local machine that connects it to the [AutoGPT hosted platform](https://platform.autogpt.net) as an execution backend — instead of an E2B cloud sandbox.
 
 Once connected, AutoGPT can:
-- Read and write files on your filesystem (jailed to a configurable root)
+- Read and write files on your filesystem (jailed to the folder selected for that chat)
 - *(Optional, disabled by default)* Execute shell commands as your user
   (per-OS shell selection — bash/zsh/pwsh/cmd)
 - *(Optional)* Take screenshots and control mouse/keyboard via Claude's computer use API
@@ -32,31 +32,39 @@ The platform-side code (WebSocket route, `LocalPCShim`, `ShimConnectionManager`,
 ## Install (alpha)
 
 ```bash
-pipx install autogpt-local-executor
+pipx install git+https://github.com/Significant-Gravitas/autogpt-local-executor.git
 
 # One-time: OAuth to your platform deployment.
 autogpt-shim auth
 
-# Global options such as --allowed-root precede the subcommand. --session-id is
-# accepted either globally or after `start`, matching the platform's setup
-# command. It can also be set as AUTOGPT_SHIM_SESSION_ID.
+# Keep the paired machine online. This opens an outbound control connection;
+# the platform's new-chat flow lets you browse and select a folder per chat.
+autogpt-shim start
+
+# High-risk capabilities are explicit start-command opt-ins:
+autogpt-shim start --enable-shell
+
+# Compatibility only: connect directly to one pre-existing copilot session.
+# In this legacy mode --allowed-root remains the one session's file jail.
 autogpt-shim \
   --allowed-root ~/autogpt-workspace \
   start --session-id "<copilot-session-id>"
-
-# High-risk capabilities are explicit start-command opt-ins:
-autogpt-shim \
-  --allowed-root ~/autogpt-workspace \
-  start --session-id "<copilot-session-id>" --enable-shell
 
 # --enable-recording is reserved for the design preview. The daemon currently
 # refuses this flag with EX_CONFIG because capture + interpretation aren't yet
 # safe to expose end to end.
 ```
 
-For autostart, put `session_id` and capability settings in the TOML config
-passed to `autogpt-shim install`; an installed service also refuses to connect
-without a session ID.
+For autostart, run `autogpt-shim install`, enable the generated per-user service,
+and omit `session_id` from the TOML configuration. The service maintains the
+persistent paired-machine connection; selected roots are isolated per chat.
+
+The platform never sends an arbitrary host path to the shim. Folder navigation
+uses short-lived opaque references issued by the host, and selecting a folder
+produces a machine-signed root grant that can restore that chat after a daemon
+restart. Folder names and canonical paths are visible to the paired platform
+during browsing; file names, file content, sizes, timestamps, and permissions
+are not returned by this control API.
 
 The daemon also fails startup if its tamper-evident audit writer cannot be
 initialized; there is no implicit unaudited mode.

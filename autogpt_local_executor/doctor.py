@@ -2,7 +2,8 @@
 `autogpt-shim doctor` — preflight checks for the shim.
 
 Per docs/COMPUTER_USE.md Q5:
-- Probes the keychain, allowed_root, display, and (on macOS) calls
+- Probes the keychain, directory browser (or legacy allowed_root), display,
+  and (on macOS) calls
   AXIsProcessTrustedWithOptions with the prompt option **on first
   invocation** so the consent dialog appears proactively.
 - Returns exit 0 when everything required is healthy, 78
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 
 from . import platform_info
 from .config import ShimConfig
+from .directory_browser import DirectoryBrowser
 
 EX_CONFIG = 78
 
@@ -42,7 +44,10 @@ class CheckResult:
 def run_doctor(config: ShimConfig) -> int:
     """Run all checks, print results, return shell exit code."""
     checks: list[CheckResult] = []
-    checks.append(_check_allowed_root(config))
+    if config.session_id and config.session_id.strip():
+        checks.append(_check_allowed_root(config))
+    else:
+        checks.append(_check_directory_browser())
     checks.append(_check_keychain())
     plat = platform_info.detect_platform()
     if plat == "darwin":
@@ -82,6 +87,27 @@ def _check_allowed_root(config: ShimConfig) -> CheckResult:
     except OSError as exc:
         return CheckResult("FAIL", "allowed_root", f"{p}: {exc}", blocking=True)
     return CheckResult("OK", "allowed_root", f"{p} exists, writable")
+
+
+def _check_directory_browser() -> CheckResult:
+    try:
+        browser = DirectoryBrowser()
+        listing = browser.list_directories(None, None)
+        browser.reset()
+        if not listing.entries:
+            return CheckResult(
+                "FAIL",
+                "folder_browser",
+                "no accessible host directory roots found",
+                blocking=True,
+            )
+        return CheckResult(
+            "OK",
+            "folder_browser",
+            f"{len(listing.entries)} accessible host root(s)",
+        )
+    except Exception as exc:
+        return CheckResult("FAIL", "folder_browser", str(exc), blocking=True)
 
 
 def _check_keychain() -> CheckResult:

@@ -139,13 +139,15 @@ User                    Shim                         AutoGPT Platform
 On every WebSocket connect, the shim includes the access token:
 
 ```
-GET /ws/local-executor/{session_id}
+GET /ws/local-executor                 # persistent machine control
+GET /ws/local-executor/{session_id}    # activated per-chat data channel
 Authorization: Bearer {access_token}
 ```
 
 Platform validates via `introspect_token(access_token)`:
 - Checks token not expired
-- Checks token belongs to the session owner
+- On data channels, checks token belongs to the session owner
+- On the control channel, registers the online machine under the token's user
 - Checks `USE_TOOLS` scope present
 - Returns user_id for the session
 

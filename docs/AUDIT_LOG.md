@@ -81,6 +81,10 @@ single JSON object with this shape:
 | `SCREENSHOT_REQUEST` | `{monitor, quality, image_bytes_returned, width?, height?}` — no image content; `width`/`height` only present on success |
 | `INPUT_ACTION` | `{action, coordinate, key, direction, clicks, text_length}` — the `text` payload is replaced by its byte length (`text_length`); `null` when the action has no text |
 | `LOCAL_LLM_COMPLETION` | `{model, prompt_chars, response_chars, finish_reason, stream, tokens_prompt?, tokens_completion?, tokens_total?}` — never the prompt text, never the response text. `tokens_*` may be `null` if the backend doesn't report them. See [LOCAL_LLM.md](LOCAL_LLM.md). |
+| `DIRECTORY_LIST` | `{browse_id, path, entries_returned, truncated}` — logs the canonical directory being viewed, never returned entry-name arrays or opaque references |
+| `SESSION_ALLOWED_ROOT_SET` | `{previous_allowed_root, allowed_root, fingerprint, revision}` |
+| `ACTIVATE_SESSION` / `RESTORE_SESSION` | `{allowed_root, fingerprint, revision}` |
+| `DETACH_SESSION` | `{allowed_root, revision}` |
 | `HELLO` | `{platform, arch, capabilities, allowed_root}` |
 | `HELLO_ACK` | `{granted_capabilities, max_concurrent, max_file_size_bytes, command_timeout_seconds}` |
 | Shim-internal | See below |
@@ -112,6 +116,11 @@ didn't trigger:
 - `LOCAL_LLM_COMPLETION` prompt messages or response content (only
   character counts and token counts). The whole point of routing to a
   local LLM is privacy; logging the prompt would defeat it.
+- Directory-list entry arrays, opaque browse references, or root grants.
+
+Concurrent per-chat child daemons share one `AuditWriter` and its lock/HMAC
+chain through immutable session-bound wrappers. They never mutate the writer's
+default session ID, so one chat's operation cannot be attributed to another.
 
 ## Tamper-evidence chain
 

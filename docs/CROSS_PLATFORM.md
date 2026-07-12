@@ -64,6 +64,23 @@ One row per dimension. `n/a` means "doesn't apply on this OS." `same` means
 | Bind mounts | n/a | Yes | n/a | Not resolved by `realpath`; treated as part of the path tree. |
 | Canonicalize call | `os.path.realpath` | `os.path.realpath` | `os.path.realpath` (Python 3.8+ resolves junctions) | Always run realpath before path-jail comparison. |
 
+### Remote directory-browser roots
+
+The persistent control channel starts at virtual host roots rather than
+accepting a path from the platform.
+
+| Platform | Roots exposed |
+|---|---|
+| macOS | Canonical home plus accessible real local data volumes immediately under `/Volumes`; system/startup volumes are excluded. |
+| Linux | Canonical home plus accessible user mounts immediately under `/media/$USER` and `/run/media/$USER`; `/`, `/proc`, `/sys`, `/dev`, and general `/run` are never roots. |
+| WSL2 | Linux home/user mounts plus accessible one-letter fixed-drive mounts immediately under `/mnt`. |
+| Windows | Canonical `%USERPROFILE%` plus accessible fixed/removable drive roots; remote, optical, recovery/system, and reparse roots are excluded. |
+
+Each request lists one immediate level with fixed host-side scan/response caps.
+Symlinks, junctions, inaccessible entries, files, and invalid wire names are
+skipped. The result includes directory display names and canonical absolute
+paths only; navigation and selection use short-lived opaque references.
+
 ### Shell selection
 
 | Dimension | macOS | Linux | Windows | Notes |

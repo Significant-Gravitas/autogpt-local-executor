@@ -17,15 +17,22 @@ import asyncio
 import json
 import logging
 import random
-from typing import Any, Never
+import secrets
+import urllib.parse
+from collections import OrderedDict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, Never, cast
 
 import websockets
 from pydantic import BaseModel, ValidationError
 
 from . import platform_info
-from .audit import AuditWriter, get_or_create_audit_key
+from .audit import AuditWriter, SessionAuditWriter, get_or_create_audit_key
 from .auth import KeychainTokenStore
 from .config import ShimConfig
+from .directory_browser import DirectoryBrowseError, DirectoryBrowser, DirectoryListing
 from .handlers import (
     CommandHandler,
     ComputerUseHandler,
@@ -35,13 +42,20 @@ from .handlers import (
 )
 from .protocol import (
     MAX_WEBSOCKET_MESSAGE_BYTES,
+    ActivateSessionMessage,
     AppLaunchMessage,
     AppListRequestMessage,
     ApplyRecordingReviewMessage,
     Arch,
+    AttachSessionMessage,
     ClipboardReadMessage,
     ClipboardWriteMessage,
     CursorPositionRequestMessage,
+    DetachSessionMessage,
+    DirectoryListRequestMessage,
+    DirectoryListResponseMessage,
+    DirectoryListResponsePayload,
+    DirectoryReferencePayload,
     DisplayInfoRequestMessage,
     ErrorCode,
     ExecuteCommandMessage,
@@ -62,7 +76,14 @@ from .protocol import (
     ProtocolVersionMismatch,
     RecordingFetchMessage,
     RequestRecordingConsentMessage,
+    RestoreSessionMessage,
     ScreenshotRequestMessage,
+    SessionActivatedMessage,
+    SessionActivatedPayload,
+    SessionAttachedMessage,
+    SessionAttachedPayload,
+    SessionRestoredMessage,
+    SessionRestoredPayload,
     SessionRevokedMessage,
     StartRecordingMessage,
     StatusMessage,
@@ -71,6 +92,7 @@ from .protocol import (
     WindowFocusMessage,
     WindowListRequestMessage,
     dump_message,
+    make_ack,
     make_error,
     make_pong,
     negotiate_version,
@@ -81,6 +103,7 @@ from .protocol import (
 from .protocol import (
     VERSION as PROTOCOL_VERSION,
 )
+from .session_grants import RootBinding, RootGrantError, RootGrantSigner
 
 # How often the shim unprompted-emits a STATUS frame (backpressure / health).
 # Also emitted on the full → not-full capacity transition edge.
@@ -129,26 +152,58 @@ class DaemonAuthenticationError(RuntimeError):
 
 logger = logging.getLogger(__name__)
 
+MAX_ACTIVE_CHILD_SESSIONS = 8
+MAX_SESSION_BINDINGS = 64
+CHILD_IDLE_TTL_SECONDS = 10 * 60
+CHILD_REAPER_INTERVAL_SECONDS = 30
+
+
+@dataclass
+class _ActiveChild:
+    daemon: ShimDaemon
+    task: asyncio.Task[None]
+
+
+@dataclass
+class _SessionLockState:
+    lock: asyncio.Lock
+    users: int = 0
+
 
 class ShimDaemon:
     def __init__(
         self,
         config: ShimConfig,
         token_store: KeychainTokenStore | Any | None = None,
-        audit: AuditWriter | None = None,
+        audit: AuditWriter | SessionAuditWriter | None = None,
+        *,
+        manage_audit_lifecycle: bool = True,
+        token_refresh_lock: asyncio.Lock | None = None,
+        machine_work_semaphore: asyncio.Semaphore | None = None,
+        computer_use_lock: asyncio.Lock | None = None,
     ) -> None:
         self.config = config
+        selected_session_id = (config.session_id or "").strip()
+        config.session_id = selected_session_id or None
         self.token_store = token_store or KeychainTokenStore()
         self.audit = audit if audit is not None else self._build_audit_writer(config)
+        self._manage_audit_lifecycle = manage_audit_lifecycle
+        self._control_mode = not bool(selected_session_id)
+        self._token_refresh_lock = token_refresh_lock or asyncio.Lock()
+        self._machine_work_semaphore = machine_work_semaphore
+        if self._control_mode and self._machine_work_semaphore is None:
+            self._machine_work_semaphore = asyncio.Semaphore(config.max_concurrent)
+        self._computer_use_lock = computer_use_lock or asyncio.Lock()
         if self.audit is not None:
             self.audit.set_machine_id(config.machine_id)
-            if config.session_id:
-                self.audit.set_session_id(config.session_id)
-        self._file_handler = FileHandler(config, audit=self.audit)
-        self._command_handler = CommandHandler(config, audit=self.audit)
-        self._computer_handler = ComputerUseHandler(config, audit=self.audit)
-        self._local_llm_handler = LocalLLMHandler(config, audit=self.audit)
-        self._recording_handler = RecordingHandler(config, audit=self.audit)
+            if selected_session_id:
+                self.audit.set_session_id(selected_session_id)
+        handler_audit = cast(AuditWriter, self.audit)
+        self._file_handler = FileHandler(config, audit=handler_audit)
+        self._command_handler = CommandHandler(config, audit=handler_audit)
+        self._computer_handler = ComputerUseHandler(config, audit=handler_audit)
+        self._local_llm_handler = LocalLLMHandler(config, audit=handler_audit)
+        self._recording_handler = RecordingHandler(config, audit=handler_audit)
         self._running = False
         self._ws: Any = None
         self._semaphore: asyncio.Semaphore | None = None
@@ -177,6 +232,19 @@ class ShimDaemon:
         self._session_started_at: float | None = None
         # Background task that emits periodic STATUS frames.
         self._status_task: asyncio.Task[None] | None = None
+        self._child_reaper_task: asyncio.Task[None] | None = None
+        self._connection_id: str | None = None
+        self._directory_browser = DirectoryBrowser() if self._control_mode else None
+        self._browser_lock = asyncio.Lock()
+        self._session_locks: dict[str, _SessionLockState] = {}
+        self._session_bindings: OrderedDict[str, RootBinding] = OrderedDict()
+        self._child_sessions: OrderedDict[str, _ActiveChild] = OrderedDict()
+        self._children_lock = asyncio.Lock()
+        self._last_request_at = now_ts()
+        audit_key = getattr(self.audit, "audit_key", None)
+        if not isinstance(audit_key, bytes):
+            audit_key = secrets.token_bytes(32)
+        self._root_grants = RootGrantSigner(audit_key, config.machine_id)
 
     @staticmethod
     def _build_audit_writer(config: ShimConfig) -> AuditWriter:
@@ -201,7 +269,8 @@ class ShimDaemon:
         # Fail closed on incomplete preview capabilities and missing OS
         # permissions before opening the WebSocket.
         await self._preflight_or_raise()
-        await self._audit_shim_start()
+        if self._manage_audit_lifecycle:
+            await self._audit_shim_start()
         self._running = True
         attempt = 0
         try:
@@ -253,10 +322,15 @@ class ShimDaemon:
                     await asyncio.sleep(delay)
                     attempt = 0
         finally:
-            await self._audit_shim_stop("graceful")
+            if self._control_mode:
+                await self._shutdown_children()
+            if self._manage_audit_lifecycle:
+                await self._audit_shim_stop("graceful")
 
     async def stop(self) -> None:
         self._running = False
+        if self._control_mode:
+            await self._shutdown_children()
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -316,7 +390,10 @@ class ShimDaemon:
             # A 401 may mean the access token expired. Refresh exactly once;
             # authorization denials (403) never rotate credentials.
             logger.info("401 on WebSocket upgrade — refreshing token and retrying once")
-            token = await self._get_access_token(refresh_on_fail=True)
+            token = await self._get_access_token(
+                refresh_on_fail=True,
+                rejected_token=token,
+            )
             if not token:
                 raise DaemonAuthenticationError(
                     "WebSocket authentication failed and the single token refresh failed"
@@ -343,6 +420,10 @@ class ShimDaemon:
     async def _run_session(self, ws) -> None:
         self._ws = ws
         self._session_started_at = now_ts()
+        if self._control_mode and self._directory_browser is not None:
+            await self._shutdown_children()
+            self._directory_browser.reset()
+            self._connection_id = None
         # Reset per-session counters so reconnects don't carry over.
         self._in_flight = 0
         self._queue_depth = 0
@@ -358,6 +439,8 @@ class ShimDaemon:
             # Start the periodic STATUS ticker AFTER handshake — we want
             # max_concurrent from HELLO_ACK before announcing capacity.
             self._status_task = asyncio.create_task(self._status_ticker(ws))
+            if self._control_mode:
+                self._child_reaper_task = asyncio.create_task(self._child_reaper(ws))
             try:
                 async for raw in ws:
                     await self._on_frame(ws, raw)
@@ -403,6 +486,13 @@ class ShimDaemon:
                 except (asyncio.CancelledError, Exception):
                     pass
                 self._status_task = None
+            if self._child_reaper_task is not None:
+                self._child_reaper_task.cancel()
+                try:
+                    await self._child_reaper_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._child_reaper_task = None
             self._ws = None
             self._session_started_at = None
             if self.audit is not None:
@@ -424,10 +514,8 @@ class ShimDaemon:
 
     def _connect_url(self) -> str:
         session_id = (self.config.session_id or "").strip()
-        if not session_id:
-            raise ValueError("A nonempty session_id is required to connect the shim")
         base = self.config.derived_ws_url.rstrip("/")
-        return f"{base}/{session_id}"
+        return f"{base}/{urllib.parse.quote(session_id, safe='')}" if session_id else base
 
     @staticmethod
     def _auth_headers(token: str | None) -> dict[str, str]:
@@ -435,25 +523,38 @@ class ShimDaemon:
             return {}
         return {"Authorization": f"Bearer {token}"}
 
-    async def _get_access_token(self, *, refresh_on_fail: bool) -> str | None:
+    async def _get_access_token(
+        self,
+        *,
+        refresh_on_fail: bool,
+        rejected_token: str | None = None,
+    ) -> str | None:
         if not refresh_on_fail:
             return await self.token_store.get_access_token()
-        # The server rejected the current access token. Force a refresh even
-        # though the rejected token is still present in the keychain.
-        try:
-            from .auth import OAuthFlow
+        async with self._token_refresh_lock:
+            # Another machine/session socket may already have rotated the
+            # refresh family while this connection was receiving its 401.
+            current_token = await self.token_store.get_access_token()
+            if (
+                rejected_token is not None
+                and current_token is not None
+                and current_token != rejected_token
+            ):
+                return current_token
+            try:
+                from .auth import OAuthFlow
 
-            flow = OAuthFlow(self.config, self.token_store)
-            await flow.refresh_token()
-            if self.audit is not None:
-                try:
-                    await self.audit.token_refreshed()
-                except Exception:
-                    logger.debug("TOKEN_REFRESHED audit emit failed", exc_info=True)
-            return await self.token_store.get_access_token()
-        except Exception as exc:
-            logger.warning("Token refresh failed: %s", exc)
-            return None
+                flow = OAuthFlow(self.config, self.token_store)
+                await flow.refresh_token()
+                if self.audit is not None:
+                    try:
+                        await self.audit.token_refreshed()
+                    except Exception:
+                        logger.debug("TOKEN_REFRESHED audit emit failed", exc_info=True)
+                return await self.token_store.get_access_token()
+            except Exception as exc:
+                logger.warning("Token refresh failed: %s", exc)
+                return None
 
     # ── Handshake ─────────────────────────────────────────────────────────
 
@@ -471,7 +572,14 @@ class ShimDaemon:
             self._disable_reconnect = True
             raise RuntimeError("HELLO payload exceeds the WebSocket message limit")
         await ws.send(raw_hello)
-        raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
+        try:
+            raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
+        except websockets.exceptions.ConnectionClosed as exc:
+            received = getattr(exc, "rcvd", None)
+            code = getattr(received, "code", None) or getattr(exc, "code", None)
+            if code in _FATAL_CLOSE_CODES:
+                self._disable_reconnect = True
+            raise
         ack = parse_message(raw_ack)
         if not isinstance(ack, HelloAckMessage):
             raise RuntimeError(f"Expected HELLO_ACK, got {type(ack).__name__}")
@@ -482,11 +590,17 @@ class ShimDaemon:
         # Honor the server's negotiated limits.
         payload = ack.payload
         expected_session_id = (self.config.session_id or "").strip()
-        if payload.session_id != expected_session_id:
+        if expected_session_id and payload.session_id != expected_session_id:
             await ws.close(code=4403, reason="HELLO_ACK session mismatch")
             raise DaemonAuthenticationError(
                 "HELLO_ACK session does not match the locally selected session"
             )
+        if not expected_session_id and payload.session_id not in (None, ""):
+            await ws.close(code=4403, reason="HELLO_ACK control mismatch")
+            raise DaemonAuthenticationError(
+                "HELLO_ACK unexpectedly bound the machine control connection to a session"
+            )
+        self._connection_id = payload.connection_id
         advertised_capabilities = set(hello.payload.capabilities)
         unexpected_capabilities = set(payload.granted_capabilities) - advertised_capabilities
         if unexpected_capabilities:
@@ -514,6 +628,24 @@ class ShimDaemon:
             except Exception:
                 logger.debug("ws.close after version mismatch failed", exc_info=True)
             raise
+        except ValueError as exc:
+            await ws.close(
+                code=WS_CLOSE_PROTOCOL_VERSION_MISMATCH,
+                reason="Invalid platform protocol version",
+            )
+            self._disable_reconnect = True
+            raise RuntimeError("HELLO_ACK contained an invalid protocol version") from exc
+        if self._control_mode and (
+            self._negotiated_version != "1.1"
+            or "directory_browse" not in payload.granted_capabilities
+            or not payload.connection_id
+        ):
+            await ws.close(
+                code=WS_CLOSE_PROTOCOL_VERSION_MISMATCH,
+                reason="Machine control requires protocol 1.1 and directory_browse",
+            )
+            self._disable_reconnect = True
+            raise RuntimeError("Platform does not support the persistent machine-control protocol")
         self.config.max_concurrent = min(
             self._local_max_concurrent,
             payload.max_concurrent,
@@ -528,10 +660,13 @@ class ShimDaemon:
         )
         self._granted_capabilities = frozenset(payload.granted_capabilities)
         self._semaphore = asyncio.Semaphore(self.config.max_concurrent)
+        if self._control_mode:
+            self._machine_work_semaphore = asyncio.Semaphore(self.config.max_concurrent)
         # Tell the AuditWriter about the now-known session_id so subsequent
         # records get correctly attributed.
         if self.audit is not None:
-            self.audit.set_session_id(payload.session_id)
+            if payload.session_id:
+                self.audit.set_session_id(payload.session_id)
             try:
                 await self.audit.config_reloaded(payload.granted_capabilities)
             except Exception:
@@ -539,7 +674,7 @@ class ShimDaemon:
         logger.info(
             "Connected. session=%s granted_capabilities=%s max_concurrent=%d "
             "timeout=%ds protocol=%s",
-            payload.session_id,
+            payload.session_id or "control",
             payload.granted_capabilities,
             self.config.max_concurrent,
             self.config.command_timeout_seconds,
@@ -556,6 +691,8 @@ class ShimDaemon:
             enable_hardware=cfg.enable_hardware,
             enable_recording=cfg.enable_recording,
         )
+        if self._control_mode:
+            caps.append("directory_browse")
         screen = platform_info.detect_screen_resolution()
         cu_features: list[str] = []
         cu_features_coarse: list[str] = []
@@ -603,11 +740,12 @@ class ShimDaemon:
         payload = HelloPayload(
             shim_version=__import__("autogpt_local_executor").__version__,
             machine_id=cfg.machine_id,
+            display_name=cfg.display_name,
             platform=Platform(platform_info.detect_platform()),
             arch=Arch(platform_info.detect_arch()),
             screen_resolution=screen,
             capabilities=caps,
-            allowed_root=str(cfg.allowed_root),
+            allowed_root=None if self._control_mode else str(cfg.allowed_root),
             local_llm_models=local_llm_models,
             hardware_devices=[],
             computer_use_features=cu_features,
@@ -652,6 +790,7 @@ class ShimDaemon:
         except (ValidationError, ValueError) as exc:
             logger.warning("Failed to parse inbound frame: %s", exc)
             return
+        self._last_request_at = now_ts()
 
         # PING is handled inline so a saturated semaphore can't starve keepalive.
         if isinstance(msg, PingMessage):
@@ -794,6 +933,44 @@ class ShimDaemon:
         except asyncio.CancelledError:
             raise
 
+    async def _child_reaper(self, ws: Any) -> None:
+        try:
+            while self._running and self._ws is ws:
+                await asyncio.sleep(CHILD_REAPER_INTERVAL_SECONDS)
+                cutoff = now_ts() - CHILD_IDLE_TTL_SECONDS
+                for session_id, active in tuple(self._child_sessions.items()):
+                    child = active.daemon
+                    if (
+                        active.task.done()
+                        or child._last_request_at > cutoff
+                        or child._recording_handler._active_recording_id is not None
+                    ):
+                        continue
+                    async with self._session_lock(session_id):
+                        current = self._child_sessions.get(session_id)
+                        if (
+                            current is not active
+                            or child._last_request_at > cutoff
+                            or child._recording_handler._active_recording_id is not None
+                        ):
+                            continue
+                        try:
+                            await self._write_control_audit(
+                                "IDLE_SESSION_DETACH",
+                                request_id=None,
+                                session_id=session_id,
+                                details={"idle_seconds": now_ts() - child._last_request_at},
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not audit idle detach for session %s",
+                                session_id,
+                            )
+                            continue
+                        await self._stop_child_session(session_id)
+        except asyncio.CancelledError:
+            raise
+
     async def _dispatch(self, ws, msg: Any, *, prequeued: bool = False) -> None:
         assert self._semaphore is not None
         # Track queue depth: incremented now, decremented exactly once when
@@ -827,7 +1004,11 @@ class ShimDaemon:
                     self._in_flight += 1
                     in_flight_owed = True
                     try:
-                        response = await self._handle(msg, send=_stream_send)
+                        if self._machine_work_semaphore is not None and not self._control_mode:
+                            async with self._machine_work_semaphore:
+                                response = await self._handle(msg, send=_stream_send)
+                        else:
+                            response = await self._handle(msg, send=_stream_send)
                     finally:
                         was_full_after_decrement = (
                             self._pending_requests >= self.config.max_concurrent
@@ -929,6 +1110,14 @@ class ShimDaemon:
         RecordingFetchMessage,
     )
 
+    _CONTROL_MESSAGE_TYPES = (
+        DirectoryListRequestMessage,
+        AttachSessionMessage,
+        ActivateSessionMessage,
+        RestoreSessionMessage,
+        DetachSessionMessage,
+    )
+
     def _required_capability(self, msg: Any) -> str | None:
         if isinstance(msg, ExecuteCommandMessage):
             return "shell"
@@ -940,9 +1129,18 @@ class ShimDaemon:
             return "local_llm"
         if isinstance(msg, self._RECORDING_MESSAGE_TYPES):
             return "recording"
+        if isinstance(msg, self._CONTROL_MESSAGE_TYPES):
+            return "directory_browse"
         return None
 
     async def _handle(self, msg: Any, *, send: Any | None = None) -> BaseModel | None:
+        is_control_message = isinstance(msg, self._CONTROL_MESSAGE_TYPES)
+        if self._control_mode and not is_control_message:
+            return make_error(
+                msg.id,
+                ErrorCode.FEATURE_NOT_SUPPORTED,
+                "Execution operations require an activated per-session data connection.",
+            )
         required_capability = self._required_capability(msg)
         if (
             required_capability is not None
@@ -959,6 +1157,16 @@ class ShimDaemon:
             )
         if isinstance(msg, ExecuteCommandMessage):
             return await self._command_handler.handle(msg)
+        if isinstance(msg, DirectoryListRequestMessage):
+            return await self._handle_directory_list(msg)
+        if isinstance(msg, AttachSessionMessage):
+            return await self._handle_attach_session(msg)
+        if isinstance(msg, ActivateSessionMessage):
+            return await self._handle_activate_session(msg)
+        if isinstance(msg, RestoreSessionMessage):
+            return await self._handle_restore_session(msg)
+        if isinstance(msg, DetachSessionMessage):
+            return await self._handle_detach_session(msg)
         if isinstance(msg, FileReadMessage):
             return await self._file_handler.handle_read(msg)
         if isinstance(msg, FileWriteMessage):
@@ -972,7 +1180,8 @@ class ShimDaemon:
         if isinstance(msg, FileMoveMessage):
             return await self._file_handler.handle_move(msg)
         if isinstance(msg, self._COMPUTER_USE_MESSAGE_TYPES):
-            return await self._computer_handler.handle(msg)
+            async with self._computer_use_lock:
+                return await self._computer_handler.handle(msg)
         if isinstance(msg, LocalLLMCompletionMessage):
             return await self._local_llm_handler.handle(msg, send=send)
         if isinstance(msg, self._RECORDING_MESSAGE_TYPES):
@@ -984,6 +1193,471 @@ class ShimDaemon:
         # Anything else (e.g., responses we didn't ask for) is silently dropped.
         logger.debug("No handler for %s; dropping", type(msg).__name__)
         return None
+
+    # ── Persistent machine control channel ──────────────────────────────
+
+    def _control_unavailable(self, msg_id: str) -> BaseModel | None:
+        if self._control_mode:
+            return None
+        return make_error(
+            msg_id,
+            ErrorCode.FEATURE_NOT_SUPPORTED,
+            "Machine-control operations are only accepted on the base control connection.",
+        )
+
+    async def _handle_directory_list(
+        self, msg: DirectoryListRequestMessage
+    ) -> DirectoryListResponseMessage | BaseModel:
+        unavailable = self._control_unavailable(msg.id)
+        if unavailable is not None:
+            return unavailable
+        assert self._directory_browser is not None
+        try:
+            async with self._browser_lock:
+                listing = await asyncio.to_thread(
+                    self._directory_browser.list_directories,
+                    msg.payload.browse_id,
+                    msg.payload.directory_ref,
+                    msg.payload.cursor,
+                )
+        except DirectoryBrowseError as exc:
+            await self._audit_control_failure(
+                "DIRECTORY_LIST",
+                msg.id,
+                exc.code,
+                {"browse_id": msg.payload.browse_id},
+            )
+            return make_error(msg.id, exc.code, exc.message)
+        await self._write_control_audit(
+            "DIRECTORY_LIST",
+            request_id=msg.id,
+            details={
+                "browse_id": listing.browse_id,
+                "path": listing.current.path if listing.current is not None else None,
+                "entries_returned": len(listing.entries),
+                "truncated": listing.truncated,
+            },
+        )
+        return DirectoryListResponseMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=self._directory_listing_payload(listing),
+        )
+
+    async def _handle_attach_session(
+        self, msg: AttachSessionMessage
+    ) -> SessionAttachedMessage | BaseModel:
+        async with self._session_lock(msg.payload.session_id):
+            return await self._handle_attach_session_locked(msg)
+
+    async def _handle_attach_session_locked(
+        self, msg: AttachSessionMessage
+    ) -> SessionAttachedMessage | BaseModel:
+        unavailable = self._control_unavailable(msg.id)
+        if unavailable is not None:
+            return unavailable
+        assert self._directory_browser is not None
+        active = self._child_sessions.get(msg.payload.session_id)
+        if active is not None and not active.task.done():
+            return make_error(
+                msg.id,
+                ErrorCode.SESSION_ALREADY_ACTIVE,
+                "Detach the active session before changing its allowed root.",
+            )
+        try:
+            async with self._browser_lock:
+                root = await asyncio.to_thread(
+                    self._directory_browser.resolve_and_consume,
+                    msg.payload.browse_id,
+                    msg.payload.directory_ref,
+                )
+            previous = self._session_bindings.get(msg.payload.session_id)
+            revision = previous.revision + 1 if previous is not None else 1
+            binding = await asyncio.to_thread(
+                self._root_grants.issue,
+                msg.payload.session_id,
+                root,
+                revision,
+            )
+        except (DirectoryBrowseError, RootGrantError) as exc:
+            code = getattr(exc, "code", ErrorCode.DIRECTORY_UNAVAILABLE)
+            await self._audit_control_failure(
+                "ATTACH_SESSION",
+                msg.id,
+                str(code),
+                {"session_id": msg.payload.session_id},
+                session_id=msg.payload.session_id,
+            )
+            return make_error(msg.id, code, str(exc))
+        await self._write_control_audit(
+            "SESSION_ALLOWED_ROOT_SET",
+            request_id=msg.id,
+            session_id=msg.payload.session_id,
+            details={
+                "previous_allowed_root": (
+                    str(previous.allowed_root) if previous is not None else None
+                ),
+                "allowed_root": str(binding.allowed_root),
+                "fingerprint": binding.fingerprint,
+                "revision": binding.revision,
+            },
+        )
+        self._remember_binding(binding)
+        return SessionAttachedMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=self._attached_payload(binding),
+        )
+
+    async def _handle_activate_session(
+        self, msg: ActivateSessionMessage
+    ) -> SessionActivatedMessage | BaseModel:
+        async with self._session_lock(msg.payload.session_id):
+            return await self._handle_activate_session_locked(msg)
+
+    async def _handle_activate_session_locked(
+        self, msg: ActivateSessionMessage
+    ) -> SessionActivatedMessage | BaseModel:
+        unavailable = self._control_unavailable(msg.id)
+        if unavailable is not None:
+            return unavailable
+        binding = self._session_bindings.get(msg.payload.session_id)
+        if binding is None:
+            return make_error(
+                msg.id,
+                ErrorCode.SESSION_NOT_ATTACHED,
+                "Attach a directory before activating this session.",
+            )
+        if binding.revision != msg.payload.revision:
+            return make_error(
+                msg.id,
+                ErrorCode.SESSION_REVISION_MISMATCH,
+                "The requested root revision is stale.",
+                details={"current_revision": binding.revision},
+            )
+        try:
+            binding = await asyncio.to_thread(
+                self._root_grants.verify,
+                binding.root_grant,
+                binding.session_id,
+            )
+        except RootGrantError as exc:
+            await self._audit_control_failure(
+                "ACTIVATE_SESSION",
+                msg.id,
+                ErrorCode.ROOT_GRANT_INVALID.value,
+                {"session_id": msg.payload.session_id},
+                session_id=msg.payload.session_id,
+            )
+            return make_error(msg.id, ErrorCode.ROOT_GRANT_INVALID, str(exc))
+        previous_binding = self._session_bindings.get(binding.session_id)
+        self._remember_binding(binding)
+        active = self._child_sessions.get(binding.session_id)
+        started_child = active is None or active.task.done()
+        try:
+            if started_child:
+                await self._start_child_session(binding)
+            await self._write_control_audit(
+                "ACTIVATE_SESSION",
+                request_id=msg.id,
+                session_id=binding.session_id,
+                details={
+                    "allowed_root": str(binding.allowed_root),
+                    "fingerprint": binding.fingerprint,
+                    "revision": binding.revision,
+                },
+            )
+        except Exception:
+            if started_child:
+                await self._stop_child_session(binding.session_id)
+            if previous_binding is None:
+                self._session_bindings.pop(binding.session_id, None)
+            else:
+                self._remember_binding(previous_binding)
+            raise
+        return SessionActivatedMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=SessionActivatedPayload(
+                session_id=binding.session_id,
+                allowed_root=str(binding.allowed_root),
+                fingerprint=binding.fingerprint,
+                revision=binding.revision,
+            ),
+        )
+
+    async def _handle_restore_session(
+        self, msg: RestoreSessionMessage
+    ) -> SessionRestoredMessage | BaseModel:
+        async with self._session_lock(msg.payload.session_id):
+            return await self._handle_restore_session_locked(msg)
+
+    async def _handle_restore_session_locked(
+        self, msg: RestoreSessionMessage
+    ) -> SessionRestoredMessage | BaseModel:
+        unavailable = self._control_unavailable(msg.id)
+        if unavailable is not None:
+            return unavailable
+        try:
+            binding = await asyncio.to_thread(
+                self._root_grants.verify,
+                msg.payload.root_grant,
+                msg.payload.session_id,
+            )
+        except RootGrantError as exc:
+            await self._audit_control_failure(
+                "RESTORE_SESSION",
+                msg.id,
+                ErrorCode.ROOT_GRANT_INVALID.value,
+                {"session_id": msg.payload.session_id},
+                session_id=msg.payload.session_id,
+            )
+            return make_error(
+                msg.id,
+                ErrorCode.ROOT_GRANT_INVALID,
+                str(exc),
+            )
+        current = self._session_bindings.get(binding.session_id)
+        if current is not None and current.revision > binding.revision:
+            return make_error(
+                msg.id,
+                ErrorCode.SESSION_REVISION_MISMATCH,
+                "The supplied root grant is older than the current binding.",
+                details={"current_revision": current.revision},
+            )
+        if (
+            current is not None
+            and current.revision == binding.revision
+            and current.fingerprint != binding.fingerprint
+        ):
+            return make_error(
+                msg.id,
+                ErrorCode.SESSION_REVISION_MISMATCH,
+                "The supplied root grant conflicts with the current binding revision.",
+                details={"current_revision": current.revision},
+            )
+        previous_binding = self._session_bindings.get(binding.session_id)
+        active = self._child_sessions.get(binding.session_id)
+        active_is_live = active is not None and not active.task.done()
+        replaced_child = active_is_live and previous_binding != binding
+        if replaced_child:
+            await self._stop_child_session(binding.session_id)
+        self._remember_binding(binding)
+        started_child = not active_is_live or replaced_child
+        try:
+            if started_child:
+                await self._start_child_session(binding)
+            await self._write_control_audit(
+                "RESTORE_SESSION",
+                request_id=msg.id,
+                session_id=binding.session_id,
+                details={
+                    "allowed_root": str(binding.allowed_root),
+                    "fingerprint": binding.fingerprint,
+                    "revision": binding.revision,
+                },
+            )
+        except Exception:
+            if started_child:
+                await self._stop_child_session(binding.session_id)
+            if previous_binding is None:
+                self._session_bindings.pop(binding.session_id, None)
+            else:
+                self._remember_binding(previous_binding)
+                if replaced_child:
+                    try:
+                        await self._start_child_session(previous_binding)
+                    except Exception:
+                        logger.exception(
+                            "Failed to restore prior child for session %s",
+                            binding.session_id,
+                        )
+            raise
+        return SessionRestoredMessage(
+            id=msg.id,
+            ts=now_ts(),
+            payload=SessionRestoredPayload(
+                session_id=binding.session_id,
+                allowed_root=str(binding.allowed_root),
+                fingerprint=binding.fingerprint,
+                revision=binding.revision,
+                root_grant=binding.root_grant,
+            ),
+        )
+
+    async def _handle_detach_session(self, msg: DetachSessionMessage) -> BaseModel:
+        async with self._session_lock(msg.payload.session_id):
+            return await self._handle_detach_session_locked(msg)
+
+    async def _handle_detach_session_locked(self, msg: DetachSessionMessage) -> BaseModel:
+        unavailable = self._control_unavailable(msg.id)
+        if unavailable is not None:
+            return unavailable
+        await self._stop_child_session(msg.payload.session_id)
+        binding = self._session_bindings.get(msg.payload.session_id)
+        await self._write_control_audit(
+            "DETACH_SESSION",
+            request_id=msg.id,
+            session_id=msg.payload.session_id,
+            details={
+                "allowed_root": str(binding.allowed_root) if binding is not None else None,
+                "revision": binding.revision if binding is not None else None,
+            },
+        )
+        self._session_bindings.pop(msg.payload.session_id, None)
+        return make_ack(msg.id)
+
+    @asynccontextmanager
+    async def _session_lock(self, session_id: str) -> AsyncIterator[None]:
+        state = self._session_locks.get(session_id)
+        if state is None:
+            state = _SessionLockState(lock=asyncio.Lock())
+            self._session_locks[session_id] = state
+        state.users += 1
+        try:
+            async with state.lock:
+                yield
+        finally:
+            state.users -= 1
+            if state.users == 0 and self._session_locks.get(session_id) is state:
+                self._session_locks.pop(session_id, None)
+
+    def _remember_binding(self, binding: RootBinding) -> None:
+        self._session_bindings.pop(binding.session_id, None)
+        self._session_bindings[binding.session_id] = binding
+        while len(self._session_bindings) > MAX_SESSION_BINDINGS:
+            for session_id in tuple(self._session_bindings):
+                active = self._child_sessions.get(session_id)
+                if active is None or active.task.done():
+                    self._session_bindings.pop(session_id, None)
+                    break
+            else:
+                raise RuntimeError("Local-executor session binding limit reached")
+
+    async def _start_child_session(self, binding: RootBinding) -> None:
+        async with self._children_lock:
+            live_count = sum(not child.task.done() for child in self._child_sessions.values())
+            if live_count >= MAX_ACTIVE_CHILD_SESSIONS:
+                raise RuntimeError("Active local-executor session limit reached")
+            child_config = self.config.model_copy(deep=True)
+            child_config.session_id = binding.session_id
+            child_config.allowed_root = binding.allowed_root
+            base_audit = (
+                self.audit.writer if isinstance(self.audit, SessionAuditWriter) else self.audit
+            )
+            if not isinstance(base_audit, AuditWriter):
+                raise RuntimeError("Child sessions require the mandatory shared audit writer")
+            session_audit = SessionAuditWriter(base_audit, binding.session_id)
+            child = ShimDaemon(
+                child_config,
+                token_store=self.token_store,
+                audit=session_audit,
+                manage_audit_lifecycle=False,
+                token_refresh_lock=self._token_refresh_lock,
+                machine_work_semaphore=self._machine_work_semaphore,
+                computer_use_lock=self._computer_use_lock,
+            )
+            child._command_handler._command_rate = self._command_handler._command_rate
+            child._command_handler._concurrency = self._command_handler._concurrency
+            child._computer_handler._screenshot_rate = self._computer_handler._screenshot_rate
+            child._local_llm_handler._inflight_lock = self._local_llm_handler._inflight_lock
+            task = asyncio.create_task(child.run(), name=f"local-executor-{binding.session_id}")
+            active = _ActiveChild(daemon=child, task=task)
+            self._child_sessions[binding.session_id] = active
+
+            def child_finished(finished: asyncio.Task[None]) -> None:
+                self._child_finished(binding.session_id, finished)
+
+            task.add_done_callback(child_finished)
+
+    def _child_finished(self, session_id: str, task: asyncio.Task[None]) -> None:
+        active = self._child_sessions.get(session_id)
+        if active is not None and active.task is task:
+            self._child_sessions.pop(session_id, None)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Child session %s stopped: %s", session_id, task.exception())
+
+    async def _stop_child_session(self, session_id: str) -> None:
+        async with self._children_lock:
+            active = self._child_sessions.pop(session_id, None)
+            if active is None:
+                return
+            await active.daemon.stop()
+            if not active.task.done():
+                active.task.cancel()
+            await asyncio.gather(active.task, return_exceptions=True)
+
+    async def _shutdown_children(self) -> None:
+        for session_id in tuple(self._child_sessions):
+            await self._stop_child_session(session_id)
+
+    @staticmethod
+    def _directory_listing_payload(listing: DirectoryListing) -> DirectoryListResponsePayload:
+        def convert(entry: Any) -> DirectoryReferencePayload:
+            return DirectoryReferencePayload(
+                directory_ref=entry.directory_ref,
+                name=entry.name,
+                path=entry.path,
+            )
+
+        return DirectoryListResponsePayload(
+            browse_id=listing.browse_id,
+            current=convert(listing.current) if listing.current is not None else None,
+            parent_ref=listing.parent_ref,
+            entries=[convert(entry) for entry in listing.entries],
+            next_cursor=listing.next_cursor,
+            truncated=listing.truncated,
+            expires_at=listing.expires_at,
+        )
+
+    @staticmethod
+    def _attached_payload(binding: RootBinding) -> SessionAttachedPayload:
+        return SessionAttachedPayload(
+            session_id=binding.session_id,
+            allowed_root=str(binding.allowed_root),
+            fingerprint=binding.fingerprint,
+            revision=binding.revision,
+            root_grant=binding.root_grant,
+        )
+
+    async def _write_control_audit(
+        self,
+        op: str,
+        *,
+        request_id: str | None,
+        details: dict[str, Any],
+        session_id: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        await self.audit.write(
+            op,
+            session_id=session_id,
+            request_id=request_id,
+            details=details,
+            result=result,
+        )
+
+    async def _audit_control_failure(
+        self,
+        op: str,
+        request_id: str,
+        error_code: str,
+        details: dict[str, Any],
+        *,
+        session_id: str | None = None,
+    ) -> None:
+        await self._write_control_audit(
+            op,
+            request_id=request_id,
+            session_id=session_id,
+            details=details,
+            result={
+                "ok": False,
+                "exit_code": None,
+                "duration_ms": 0,
+                "error_code": error_code,
+            },
+        )
 
     # ── Preflight ────────────────────────────────────────────────────
 

@@ -39,17 +39,34 @@ def test_start_session_id_is_accepted_before_or_after_subcommand_without_overwri
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_id", [None, "", "   "])
-async def test_start_requires_a_nonempty_session_id(
-    tmp_path: Path, session_id: str | None, capsys: pytest.CaptureFixture[str]
+async def test_start_without_session_uses_persistent_control_mode(
+    tmp_path: Path,
+    session_id: str | None,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import autogpt_local_executor.daemon as daemon_module
+
+    ran = False
+
+    class ControlDaemon:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def run(self) -> None:
+            nonlocal ran
+            ran = True
+
+    monkeypatch.setattr(daemon_module, "ShimDaemon", ControlDaemon)
     config = ShimConfig(
         session_id=session_id,
         allowed_root=tmp_path,
         audit_log_path=tmp_path / "audit.log",
     )
 
-    assert await cli._cmd_start(config) == 2
-    assert "requires a nonempty session ID" in capsys.readouterr().out
+    assert await cli._cmd_start(config) == 0
+    assert ran is True
+    assert "persistent machine control" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

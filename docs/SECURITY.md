@@ -40,7 +40,9 @@ advertised, and causes startup to fail closed if enabled. The platform's grant
 cannot turn on a locally disabled capability.
 
 ### Layer 2: Allowed Root Path Jail
-All `FILE_*` operations are jailed to `allowed_root` (configured by user at shim startup).
+All `FILE_*` operations are jailed to the per-chat `allowed_root`. In normal
+control mode the user selects it through one-level remote directory browsing;
+legacy `--session-id` mode still reads it from startup configuration.
 The full algorithm is in [CROSS_PLATFORM.md → Path Jail Strategy](CROSS_PLATFORM.md#path-jail-strategy);
 a naive `path.startswith(allowed_root)` check is **not enough** and the shim
 must use the prescribed algorithm. Violation → `PATH_OUTSIDE_ALLOWED_ROOT`
@@ -58,6 +60,19 @@ Recommended: create a dedicated workspace directory, not your home dir.
 ~/                      ← bad, don't do this
 /                       ← extremely bad
 ```
+
+The platform cannot submit a path to the host browser. Navigation uses random,
+five-minute opaque references bound to the current control connection. A
+selection consumes the browse and produces an HMAC-signed root grant bound to
+machine, session, revision, canonical path, and filesystem fingerprint. Every
+control reconnect invalidates all outstanding references. Restoring a session
+requires the grant and revalidates the live directory identity.
+
+Directory browsing exposes immediate directory names and canonical paths to the
+paired platform. It never returns files, content, sizes, timestamps,
+permissions, symlinks/junctions, inaccessible directories, or recursive data.
+Control connections cannot execute data-plane operations; activated children
+use copied configuration and immutable session-bound audit contexts.
 
 #### Per-OS path attacks the shim must catch
 
@@ -92,10 +107,11 @@ running in an unaudited degraded mode.
 
 ### Layer 4: Rate Limiting (Shim-Side)
 Shim enforces:
-- Max 60 commands per minute per session
-- Max 10 concurrent commands, additionally bounded by negotiated `max_concurrent`
+- Max 60 commands per minute across all child chats on the machine
+- Max 10 concurrent commands across all child chats, additionally bounded by
+  the machine-wide negotiated `max_concurrent`
 - Max 10 MiB per file read/write by default; text responses reserve JSON framing headroom
-- Max 10 screenshots per minute (computer use)
+- Max 10 screenshots per minute across all child chats (computer use)
 
 Exceeding limits → `SHIM_OVERLOADED` error returned to platform.
 

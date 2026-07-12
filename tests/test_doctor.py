@@ -38,6 +38,22 @@ def test_doctor_returns_zero_when_computer_use_not_requested(
     assert rc == 0
 
 
+def test_control_doctor_checks_browser_without_creating_legacy_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing_root = tmp_path / "must-not-be-created"
+    monkeypatch.setattr(doctor.platform_info, "detect_platform", lambda: "linux")
+    monkeypatch.setattr(
+        "autogpt_local_executor.computer_use.get_backend",
+        lambda _: MagicMock(display_info=lambda: []),
+    )
+    config = _config(tmp_path, session_id=None)
+    config.allowed_root = missing_root
+
+    assert doctor.run_doctor(config) == 0
+    assert not missing_root.exists()
+
+
 def test_doctor_returns_78_when_ax_denied_and_computer_use_requested(
     tmp_path: Path, monkeypatch
 ) -> None:

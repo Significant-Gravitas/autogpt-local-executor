@@ -152,11 +152,11 @@ Either side of merge to the tap/bucket:
 
 ```bash
 # macOS / Linux
-pipx install autogpt-local-executor==0.0.1
+pipx install git+https://github.com/Significant-Gravitas/autogpt-local-executor.git
 autogpt-shim --version  # confirms install
 autogpt-shim doctor      # confirms permissions / TCC consent
-# Don't `autogpt-shim start` yet — coordinate with the platform team
-# to make sure a test session is ready to receive the connection.
+autogpt-shim auth
+autogpt-shim start       # opens the persistent outbound machine connection
 
 # Homebrew (after tap merge)
 brew install Significant-Gravitas/tap/autogpt-local-executor

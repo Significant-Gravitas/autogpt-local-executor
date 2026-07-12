@@ -94,7 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--session-id",
         default=None,
-        help="Platform copilot session to attach to (required for start).",
+        help="Legacy direct copilot session. Omit for the persistent machine control channel.",
     )
     parser.add_argument(
         "--log-level",
@@ -108,7 +108,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--session-id",
         dest="session_id",
         default=argparse.SUPPRESS,
-        help="Platform copilot session to attach to (required; also accepted globally).",
+        help="Legacy direct copilot session (also accepted globally).",
     )
     start_p.add_argument(
         "--enable-shell",
@@ -226,16 +226,12 @@ async def _cmd_start(config) -> int:
     from .auth import KeychainTokenStore
     from .daemon import DaemonAuthenticationError, DaemonPreflightError, ShimDaemon
 
-    if not config.session_id or not config.session_id.strip():
-        print(
-            "Start requires a nonempty session ID. Pass `--session-id <id>` before "
-            "the `start` command or set AUTOGPT_SHIM_SESSION_ID.",
-            flush=True,
-        )
-        return 2
-
     print(f"Starting shim daemon (machine_id={config.machine_id})")
-    print(f"Allowed root: {config.allowed_root}")
+    if config.session_id and config.session_id.strip():
+        print(f"Legacy direct session: {config.session_id.strip()}")
+        print(f"Allowed root: {config.allowed_root}")
+    else:
+        print("Mode: persistent machine control (folders are selected per chat)")
     if config.enable_shell:
         print("WARNING: shell is enabled and can access anything your user account can access.")
     print("Press Ctrl+C to stop.\n")
@@ -262,7 +258,11 @@ def _cmd_status(config, args) -> None:
     # TODO: check pidfile / unix socket for running daemon status.
     print("Status check not yet implemented.")
     print(f"Configured platform: {config.platform_url}")
-    print(f"Configured allowed_root: {config.allowed_root}")
+    if config.session_id and config.session_id.strip():
+        print(f"Legacy session: {config.session_id.strip()}")
+        print(f"Configured allowed_root: {config.allowed_root}")
+    else:
+        print("Mode: persistent machine control; allowed roots are selected per chat")
     print()
     _print_autostart_status()
 

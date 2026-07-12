@@ -5,9 +5,12 @@
 ## Transport
 
 - **Protocol**: WebSocket over TLS (`wss://`)
-- **Endpoint**: `wss://platform.autogpt.net/ws/local-executor/{session_id}`
-- **Session binding**: the shim requires an explicit, nonempty `session_id` at
-  startup; it never falls back to a shared `default` session.
+- **Control endpoint**: `wss://platform.autogpt.net/ws/local-executor`. Normal
+  `autogpt-shim start` keeps this OAuth-authenticated machine connection alive.
+- **Data endpoint**: `wss://platform.autogpt.net/ws/local-executor/{session_id}`.
+  The control channel activates isolated child runtimes on this existing route.
+- **Legacy binding**: explicitly passing `--session-id` skips control mode and
+  connects directly to the data endpoint for compatibility.
 - **Frame limit**: the shim accepts WebSocket messages up to 16 MiB, matching
   the platform relay/Uvicorn envelope cap. Per-operation payload limits remain
   the lower negotiated `HELLO_ACK.max_file_size_bytes` value.
@@ -23,7 +26,7 @@ All messages are JSON with this envelope:
   "type": "MESSAGE_TYPE",
   "id": "uuid-v4",
   "ts": 1712345678.123,
-  "version": "1.0",
+  "version": "1.1",
   "payload": { ... }
 }
 ```
@@ -67,8 +70,8 @@ on the platform side, the session SHOULD be torn down with code 4426).
 
 | Side | Maximum | Notes |
 |---|---|---|
-| Shim | `1.0` | `autogpt_local_executor.protocol.VERSION` |
-| Platform | `1.0` | Mirror this constant in the platform repo. |
+| Shim | `1.1` | `autogpt_local_executor.protocol.VERSION` |
+| Platform | `1.1` | Mirror this constant in the platform repo. |
 
 ---
 
@@ -82,15 +85,16 @@ on the platform side, the session SHOULD be torn down with code 4426).
   "type": "HELLO",
   "id": "uuid",
   "ts": 1234567890.0,
-  "version": "1.0",
+  "version": "1.1",
   "payload": {
     "shim_version": "0.1.0",
-    "protocol_version": "1.0",     // max wire version this shim supports
+    "protocol_version": "1.1",     // max wire version this shim supports
     "machine_id": "hostname-uuid4",
     "platform": "darwin",          // "darwin" | "linux" | "windows" | "wsl2"
     "arch": "arm64",               // "x86_64" | "arm64" (normalized; see below)
     "screen_resolution": [2560, 1440],   // null if computer_use not available
     "capabilities": [
+      "directory_browse",          // control WS only
       "shell",                     // optional: explicit local --enable-shell opt-in
       "files",                     // always present
       "computer_use",              // optional: pyautogui available
@@ -99,7 +103,7 @@ on the platform side, the session SHOULD be torn down with code 4426).
       "hardware_usb",              // optional: pyusb available
       "hardware_gpio"              // optional: RPi.GPIO available
     ],
-    "allowed_root": "/Users/alice/autogpt-workspace",
+    "allowed_root": null,        // control WS; canonical root on a data WS
     "local_llm_models": ["llama3.2:3b", "mistral:7b"],   // empty if no local_llm cap
     "hardware_devices": [
       {"type": "serial", "port": "/dev/ttyUSB0", "desc": "Arduino Uno"},
@@ -119,10 +123,11 @@ flag is enabled, until capture and interpretation are complete end to end.
   "type": "HELLO_ACK",
   "id": "same-uuid-as-HELLO",
   "ts": 1234567890.1,
-  "version": "1.0",
+  "version": "1.1",
   "payload": {
-    "session_id": "session-uuid",
-    "protocol_version": "1.0",     // max wire version this platform supports
+    "session_id": null,          // null on control; exact ID on data WS
+    "connection_id": null,       // optional platform presence generation
+    "protocol_version": "1.1",     // max wire version this platform supports
     "granted_capabilities": ["shell", "files"],  // subset platform approved
     "max_file_size_bytes": 10485760,
     "command_timeout_seconds": 30,
@@ -142,9 +147,127 @@ All three limits must be positive. The shim applies the lower of its local
 configuration and the value in `HELLO_ACK`, so the platform can reduce a
 ceiling but cannot expand access beyond the user's local policy.
 
-The ACK must carry the same message ID as `HELLO`, the same session ID selected
-at startup, and only capabilities advertised by the shim. The shim rejects a
-mismatch and enforces the granted subset on every subsequent request.
+The ACK must carry the same message ID as `HELLO` and only capabilities
+advertised by the shim. On a data connection it must carry the exact selected
+session ID. On the base control connection it must carry a null/empty session
+ID, an opaque `connection_id`, protocol 1.1, and the `directory_browse`
+capability. A control daemon fails terminally when any of those fields are
+missing. The shim enforces the granted subset on every subsequent request.
+
+### Machine control and per-chat roots
+
+The base control connection advertises `directory_browse`. It accepts only the
+messages in this section; `FILE_*`, shell, computer-use, local-LLM, and recording
+messages are rejected until an isolated per-session data connection is active.
+All browse references are invalidated whenever the control WebSocket reconnects.
+
+#### `DIRECTORY_LIST_REQUEST` / `DIRECTORY_LIST_RESPONSE`
+
+Both reference fields null start a five-minute browse and return virtual roots.
+Subsequent requests must provide both opaque values. When `next_cursor` is
+present, the caller can send it with the same browse and directory references
+to fetch another page. Cursors are minted and resolved only by the host. There
+is no platform path, recursive flag, glob, offset, or caller-controlled limit.
+
+```json
+{
+  "type": "DIRECTORY_LIST_REQUEST",
+  "id": "request-uuid",
+  "ts": 1234567890.0,
+  "payload": {"browse_id": null, "directory_ref": null}
+}
+```
+
+```json
+{
+  "type": "DIRECTORY_LIST_RESPONSE",
+  "id": "request-uuid",
+  "ts": 1234567890.1,
+  "payload": {
+    "browse_id": "host-opaque-id",
+    "current": null,
+    "parent_ref": null,
+    "entries": [{
+      "directory_ref": "host-opaque-ref",
+      "name": "Home",
+      "path": "/Users/alice"
+    }],
+    "next_cursor": null,
+    "truncated": false,
+    "expires_at": 1234568190.0
+  }
+}
+```
+
+Each page contains at most 200 immediate real directories and a browse scans at
+most 1,000 entries. `truncated` is true only when that hard scan/reference bound
+omits entries; `next_cursor` indicates that another safe page is available.
+Files, symlinks/junctions, inaccessible entries, and special roots are skipped.
+Responses carry only display name, canonical absolute path, and opaque
+reference—never content, size, timestamps, permissions, or recursive metadata.
+
+#### `ATTACH_SESSION` / `SESSION_ATTACHED`
+
+The platform allocates a draft/chat session ID and returns the reference chosen
+by the user. `expected_connection_id` is carried for platform race detection;
+the host intentionally ignores it because reconnect invalidation makes stale
+references fail closed.
+
+```json
+{
+  "type": "ATTACH_SESSION",
+  "id": "request-uuid",
+  "ts": 1234567890.0,
+  "payload": {
+    "session_id": "session-uuid",
+    "browse_id": "host-opaque-id",
+    "directory_ref": "host-opaque-ref",
+    "expected_connection_id": "platform-generation-or-null"
+  }
+}
+```
+
+```json
+{
+  "type": "SESSION_ATTACHED",
+  "id": "request-uuid",
+  "ts": 1234567890.1,
+  "payload": {
+    "session_id": "session-uuid",
+    "allowed_root": "/Users/alice/Projects/AutoGPT",
+    "fingerprint": "64-lowercase-hex-characters",
+    "revision": 1,
+    "root_grant": "v1.base64url-claims.base64url-hmac"
+  }
+}
+```
+
+The shim strictly re-resolves the directory, fingerprints its canonical path
+and filesystem identity, audits the change, consumes the browse, and signs a
+grant with a key derived from the machine-only audit key. The global config is
+never changed.
+
+#### Activation, restoration, and detachment
+
+`ACTIVATE_SESSION {session_id, revision}` starts a child daemon with a deep copy
+of configuration and the attached root. It replies `SESSION_ACTIVATED` with
+`session_id`, `allowed_root`, `fingerprint`, and `revision`; readiness of the
+child data WebSocket remains the platform presence registry's responsibility.
+
+`RESTORE_SESSION {session_id, root_grant}` verifies signature, machine/session
+binding, canonical root, and current filesystem fingerprint, then restores and
+starts the child. `SESSION_RESTORED` returns the same binding fields plus the
+grant. Grants are durable but revocable through OAuth; they are tamper-evident,
+not encrypted.
+
+`DETACH_SESSION {session_id}` stops the child, removes the in-memory binding,
+and replies with the standard `ACK`. An active session's root is immutable;
+detach before attaching a different folder.
+
+The control daemon also stops a non-recording child after ten minutes without
+a data request, while retaining its signed binding for `RESTORE_SESSION`. This
+prevents abandoned chats from consuming the eight-child safety cap; the
+platform transparently restores the child when the next turn begins.
 
 #### `HELLO.platform` enum
 
@@ -522,7 +645,7 @@ cloud-side completion.
   "type": "LOCAL_LLM_COMPLETION",
   "id": "req-uuid",
   "ts": 1234567890.0,
-  "version": "1.0",
+  "version": "1.1",
   "payload": {
     "model": "llama3.2:3b",
     "messages": [
@@ -560,7 +683,7 @@ cloud-side completion.
   "type": "LOCAL_LLM_COMPLETION_CHUNK",
   "id": "req-uuid",
   "ts": 1234567890.1,
-  "version": "1.0",
+  "version": "1.1",
   "payload": {
     "delta": "The user spent ",
     "finish_reason": null
@@ -582,7 +705,7 @@ metadata.
   "type": "LOCAL_LLM_COMPLETION_RESPONSE",
   "id": "req-uuid",
   "ts": 1234567890.5,
-  "version": "1.0",
+  "version": "1.1",
   "payload": {
     "content": "The user spent ...",
     "finish_reason": "stop",
@@ -744,6 +867,17 @@ Error codes:
   `HELLO_ACK.max_file_size_bytes`
 - `DEPENDENCY_MISSING` — a runtime dep needed for the op (pyautogui,
   Pillow, xclip, etc.) isn't installed on the shim host
+- `DIRECTORY_REFERENCE_INVALID` — browse/reference pair is malformed,
+  expired, consumed, or belongs to a prior control connection
+- `DIRECTORY_UNAVAILABLE` — selected directory disappeared, changed into a
+  link/junction, or is no longer accessible
+- `ROOT_GRANT_INVALID` — restore/activation grant is malformed, has an invalid
+  HMAC or machine/session binding, or its directory fingerprint changed
+- `SESSION_NOT_ATTACHED` — activation was requested before folder attachment
+- `SESSION_ALREADY_ACTIVE` — root replacement was requested while the child
+  data runtime was active; detach first
+- `SESSION_REVISION_MISMATCH` — activation/restore supplied a stale or
+  conflicting root revision
 - `WINDOW_STALE` — computer-use `window_id` no longer maps to a live
   window. Caller must re-issue `WINDOW_LIST_REQUEST`. See
   [COMPUTER_USE.md §Q2](COMPUTER_USE.md#q2--window_id-lifetime-locked).
@@ -824,7 +958,7 @@ orphaning the prior shim's pending requests with no clean error.
   "type": "SESSION_REVOKED",
   "id": "uuid",
   "ts": 1234567890.0,
-  "version": "1.0",
+  "version": "1.1",
   "payload": {
     "reason": "another_shim_connected",   // | "user_revoked" | "platform_shutdown"
     "new_shim_machine_id": "macbook-air-7f3c"   // optional, set when reason is another_shim_connected
@@ -951,7 +1085,7 @@ ticket; this section is the contract.
   "type": "STATUS",
   "id": "uuid",
   "ts": 1234567890.0,
-  "version": "1.0",
+  "version": "1.1",
   "pending_capacity": 3,
   "payload": {
     "in_flight": 1,

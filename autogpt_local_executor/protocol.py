@@ -18,7 +18,7 @@ import uuid
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 # ── Protocol version ─────────────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 #     Both sides MUST tolerate forward-compatible additions within a major.
 #   * Every envelope SHOULD carry `version` matching the negotiated value,
 #     but receivers MUST be lenient — HELLO-time negotiation is the truth.
-VERSION: str = "1.0"
+VERSION: str = "1.1"
 
 # The platform relay and shim both cap decoded WebSocket messages at 16 MiB.
 # JSON can expand a text byte to six bytes (for example NUL -> ``\u0000``),
@@ -39,6 +39,7 @@ VERSION: str = "1.0"
 MAX_WEBSOCKET_MESSAGE_BYTES: int = 16 * 1024 * 1024
 MAX_WIRE_TEXT_CONTENT_BYTES: int = (MAX_WEBSOCKET_MESSAGE_BYTES - 64 * 1024) // 6
 MAX_WIRE_BASE64_CONTENT_BYTES: int = (MAX_WEBSOCKET_MESSAGE_BYTES - 64 * 1024) * 3 // 4
+SESSION_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 
 
 def _split_version(v: str) -> tuple[int, int]:
@@ -108,6 +109,15 @@ class ProtocolVersionMismatch(Exception):
 class MessageType(StrEnum):
     HELLO = "HELLO"
     HELLO_ACK = "HELLO_ACK"
+    DIRECTORY_LIST_REQUEST = "DIRECTORY_LIST_REQUEST"
+    DIRECTORY_LIST_RESPONSE = "DIRECTORY_LIST_RESPONSE"
+    ATTACH_SESSION = "ATTACH_SESSION"
+    SESSION_ATTACHED = "SESSION_ATTACHED"
+    ACTIVATE_SESSION = "ACTIVATE_SESSION"
+    SESSION_ACTIVATED = "SESSION_ACTIVATED"
+    RESTORE_SESSION = "RESTORE_SESSION"
+    SESSION_RESTORED = "SESSION_RESTORED"
+    DETACH_SESSION = "DETACH_SESSION"
     EXECUTE_COMMAND = "EXECUTE_COMMAND"
     COMMAND_RESULT = "COMMAND_RESULT"
     FILE_READ = "FILE_READ"
@@ -181,6 +191,12 @@ class ErrorCode(StrEnum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
     DEPENDENCY_MISSING = "DEPENDENCY_MISSING"
+    DIRECTORY_REFERENCE_INVALID = "DIRECTORY_REFERENCE_INVALID"
+    DIRECTORY_UNAVAILABLE = "DIRECTORY_UNAVAILABLE"
+    ROOT_GRANT_INVALID = "ROOT_GRANT_INVALID"
+    SESSION_NOT_ATTACHED = "SESSION_NOT_ATTACHED"
+    SESSION_ALREADY_ACTIVE = "SESSION_ALREADY_ACTIVE"
+    SESSION_REVISION_MISMATCH = "SESSION_REVISION_MISMATCH"
     # Computer-use additions (see docs/COMPUTER_USE.md Q1-Q5).
     WINDOW_STALE = "WINDOW_STALE"
     PERMISSION_PENDING = "PERMISSION_PENDING"
@@ -267,11 +283,12 @@ class _Payload(BaseModel):
 class HelloPayload(_Payload):
     shim_version: str
     machine_id: str
+    display_name: str = Field(default="", max_length=128)
     platform: Platform
     arch: Arch
     screen_resolution: tuple[int, int] | None = None
     capabilities: list[str]
-    allowed_root: str
+    allowed_root: str | None
     local_llm_models: list[str] = Field(default_factory=list)
     hardware_devices: list[dict[str, Any]] = Field(default_factory=list)
     # Computer-use feature advertisement, per COMPUTER_USE.md.
@@ -291,7 +308,8 @@ class HelloPayload(_Payload):
 
 
 class HelloAckPayload(_Payload):
-    session_id: str
+    session_id: str | None = Field(default=None, pattern=SESSION_ID_PATTERN)
+    connection_id: str | None = None
     granted_capabilities: list[str]
     max_file_size_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     command_timeout_seconds: int = Field(default=30, gt=0)
@@ -299,6 +317,80 @@ class HelloAckPayload(_Payload):
     # Highest wire-protocol version this platform supports. "major.minor".
     # Effective negotiated version = same major, min(shim_minor, plat_minor).
     protocol_version: str = VERSION
+
+
+class DirectoryListRequestPayload(_Payload):
+    browse_id: str | None = Field(default=None, min_length=1, max_length=256)
+    directory_ref: str | None = Field(default=None, min_length=1, max_length=256)
+    cursor: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_reference_pair(self) -> DirectoryListRequestPayload:
+        if (self.browse_id is None) != (self.directory_ref is None):
+            raise ValueError("browse_id and directory_ref must both be null or both be set")
+        if self.cursor is not None and self.browse_id is None:
+            raise ValueError("cursor requires browse_id and directory_ref")
+        return self
+
+
+class DirectoryReferencePayload(_Payload):
+    directory_ref: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=1024)
+    path: str = Field(min_length=1, max_length=32767)
+
+
+class DirectoryListResponsePayload(_Payload):
+    browse_id: str = Field(min_length=1, max_length=256)
+    current: DirectoryReferencePayload | None = None
+    parent_ref: str | None = Field(default=None, min_length=1, max_length=256)
+    entries: list[DirectoryReferencePayload] = Field(max_length=200)
+    next_cursor: str | None = Field(default=None, min_length=1, max_length=256)
+    truncated: bool = False
+    expires_at: float
+
+
+class AttachSessionPayload(_Payload):
+    session_id: str = Field(pattern=SESSION_ID_PATTERN)
+    browse_id: str = Field(min_length=1, max_length=256)
+    directory_ref: str = Field(min_length=1, max_length=256)
+    expected_connection_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class SessionAttachedPayload(_Payload):
+    session_id: str = Field(pattern=SESSION_ID_PATTERN)
+    allowed_root: str = Field(min_length=1, max_length=32767)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    revision: int = Field(ge=1)
+    root_grant: str = Field(min_length=1, max_length=131072)
+
+
+class ActivateSessionPayload(_Payload):
+    session_id: str = Field(pattern=SESSION_ID_PATTERN)
+    revision: int = Field(ge=1)
+
+
+class SessionActivatedPayload(_Payload):
+    session_id: str = Field(pattern=SESSION_ID_PATTERN)
+    allowed_root: str = Field(min_length=1, max_length=32767)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    revision: int = Field(ge=1)
+
+
+class RestoreSessionPayload(_Payload):
+    session_id: str = Field(pattern=SESSION_ID_PATTERN)
+    root_grant: str = Field(min_length=1, max_length=131072)
+
+
+class SessionRestoredPayload(_Payload):
+    session_id: str = Field(pattern=SESSION_ID_PATTERN)
+    allowed_root: str = Field(min_length=1, max_length=32767)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    revision: int = Field(ge=1)
+    root_grant: str = Field(min_length=1, max_length=131072)
+
+
+class DetachSessionPayload(_Payload):
+    session_id: str = Field(pattern=SESSION_ID_PATTERN)
 
 
 class ExecuteCommandPayload(_Payload):
@@ -959,6 +1051,51 @@ class HelloAckMessage(_Envelope):
     payload: HelloAckPayload
 
 
+class DirectoryListRequestMessage(_Envelope):
+    type: Literal[MessageType.DIRECTORY_LIST_REQUEST] = MessageType.DIRECTORY_LIST_REQUEST
+    payload: DirectoryListRequestPayload
+
+
+class DirectoryListResponseMessage(_Envelope):
+    type: Literal[MessageType.DIRECTORY_LIST_RESPONSE] = MessageType.DIRECTORY_LIST_RESPONSE
+    payload: DirectoryListResponsePayload
+
+
+class AttachSessionMessage(_Envelope):
+    type: Literal[MessageType.ATTACH_SESSION] = MessageType.ATTACH_SESSION
+    payload: AttachSessionPayload
+
+
+class SessionAttachedMessage(_Envelope):
+    type: Literal[MessageType.SESSION_ATTACHED] = MessageType.SESSION_ATTACHED
+    payload: SessionAttachedPayload
+
+
+class ActivateSessionMessage(_Envelope):
+    type: Literal[MessageType.ACTIVATE_SESSION] = MessageType.ACTIVATE_SESSION
+    payload: ActivateSessionPayload
+
+
+class SessionActivatedMessage(_Envelope):
+    type: Literal[MessageType.SESSION_ACTIVATED] = MessageType.SESSION_ACTIVATED
+    payload: SessionActivatedPayload
+
+
+class RestoreSessionMessage(_Envelope):
+    type: Literal[MessageType.RESTORE_SESSION] = MessageType.RESTORE_SESSION
+    payload: RestoreSessionPayload
+
+
+class SessionRestoredMessage(_Envelope):
+    type: Literal[MessageType.SESSION_RESTORED] = MessageType.SESSION_RESTORED
+    payload: SessionRestoredPayload
+
+
+class DetachSessionMessage(_Envelope):
+    type: Literal[MessageType.DETACH_SESSION] = MessageType.DETACH_SESSION
+    payload: DetachSessionPayload
+
+
 class ExecuteCommandMessage(_Envelope):
     type: Literal[MessageType.EXECUTE_COMMAND] = MessageType.EXECUTE_COMMAND
     payload: ExecuteCommandPayload
@@ -1213,6 +1350,15 @@ class RecordingStepMessage(_Envelope):
 Message = Annotated[
     HelloMessage
     | HelloAckMessage
+    | DirectoryListRequestMessage
+    | DirectoryListResponseMessage
+    | AttachSessionMessage
+    | SessionAttachedMessage
+    | ActivateSessionMessage
+    | SessionActivatedMessage
+    | RestoreSessionMessage
+    | SessionRestoredMessage
+    | DetachSessionMessage
     | ExecuteCommandMessage
     | CommandResultMessage
     | FileReadMessage
@@ -1326,6 +1472,8 @@ __all__ = [
     "Arch",
     "AckMessage",
     "AckPayload",
+    "ActivateSessionMessage",
+    "ActivateSessionPayload",
     "ApplyRecordingReviewMessage",
     "ApplyRecordingReviewPayload",
     "AppInfo",
@@ -1335,6 +1483,8 @@ __all__ = [
     "AppListRequestPayload",
     "AppListResponseMessage",
     "AppListResponsePayload",
+    "AttachSessionMessage",
+    "AttachSessionPayload",
     "ClipboardReadMessage",
     "ClipboardReadPayload",
     "ClipboardReadResponseMessage",
@@ -1347,6 +1497,13 @@ __all__ = [
     "CursorPositionRequestPayload",
     "CursorPositionResponseMessage",
     "CursorPositionResponsePayload",
+    "DetachSessionMessage",
+    "DetachSessionPayload",
+    "DirectoryListRequestMessage",
+    "DirectoryListRequestPayload",
+    "DirectoryListResponseMessage",
+    "DirectoryListResponsePayload",
+    "DirectoryReferencePayload",
     "DisplayInfoRequestMessage",
     "DisplayInfoRequestPayload",
     "DisplayInfoResponseMessage",
@@ -1416,6 +1573,8 @@ __all__ = [
     "RecordingMode",
     "RequestRecordingConsentMessage",
     "RequestRecordingConsentPayload",
+    "RestoreSessionMessage",
+    "RestoreSessionPayload",
     "RecordingStartedMessage",
     "RecordingStartedPayload",
     "RecordingReviewAppliedMessage",
@@ -1434,6 +1593,12 @@ __all__ = [
     "SemanticAction",
     "SessionRevokedMessage",
     "SessionRevokedPayload",
+    "SessionActivatedMessage",
+    "SessionActivatedPayload",
+    "SessionAttachedMessage",
+    "SessionAttachedPayload",
+    "SessionRestoredMessage",
+    "SessionRestoredPayload",
     "Shell",
     "StartRecordingMessage",
     "StartRecordingPayload",

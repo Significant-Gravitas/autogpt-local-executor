@@ -282,6 +282,21 @@ def _merge_env(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
 # ── EXECUTE_COMMAND ──────────────────────────────────────────────────────────
 
 
+class _CommandConcurrency:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.active = 0
+
+    def acquire(self) -> bool:
+        if self.active >= self.limit:
+            return False
+        self.active += 1
+        return True
+
+    def release(self) -> None:
+        self.active = max(self.active - 1, 0)
+
+
 class CommandHandler:
     def __init__(
         self,
@@ -291,7 +306,7 @@ class CommandHandler:
         self.config = config
         self.audit = audit
         self._command_rate = _SlidingWindowRateLimiter(config.max_commands_per_minute)
-        self._active_commands = 0
+        self._concurrency = _CommandConcurrency(config.max_concurrent_commands)
 
     async def handle(self, msg: ExecuteCommandMessage) -> CommandResultMessage | ErrorMessage:
         if not self.config.enable_shell:
@@ -312,7 +327,7 @@ class CommandHandler:
                 ErrorCode.SHIM_OVERLOADED,
                 f"Command rate limit exceeded ({self.config.max_commands_per_minute}/minute).",
             )
-        if self._active_commands >= self.config.max_concurrent_commands:
+        if not self._concurrency.acquire():
             await self._audit(
                 msg.id,
                 msg.payload,
@@ -324,11 +339,10 @@ class CommandHandler:
                 ErrorCode.SHIM_OVERLOADED,
                 "Concurrent command limit exceeded.",
             )
-        self._active_commands += 1
         try:
             return await self._execute(msg)
         finally:
-            self._active_commands -= 1
+            self._concurrency.release()
 
     async def _execute(self, msg: ExecuteCommandMessage) -> CommandResultMessage | ErrorMessage:
         payload = msg.payload

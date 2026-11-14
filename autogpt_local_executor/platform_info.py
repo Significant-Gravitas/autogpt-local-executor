@@ -591,17 +591,21 @@ def default_audit_log_path() -> Path:
 # ── Filesystem case-sensitivity probe ────────────────────────────────────────
 
 
-@lru_cache(maxsize=64)
 def is_case_insensitive_fs(path: str | os.PathLike[str]) -> bool:
     """Probe the filesystem that contains `path`.
 
     Per CROSS_PLATFORM.md: macOS / Windows default to insensitive, Linux
     to sensitive, but all three have toggles per volume / per directory.
     One of the folder's own entries is looked up again with its letters'
-    case swapped, which reads only (_folds_case_by_lookup); a folder with
-    no entry to look up gets a probe file made in it for a moment instead.
-    Where neither can be done (an empty folder on a read-only mount), the
-    OS's default answers.
+    case swapped, which reads only (_folds_case_by_lookup). Where no entry
+    serves (an empty folder, say), the OS's default answers.
+
+    Nothing is written to tell. A folder with no entry to look up got a
+    probe file made in it for a moment, which sync clients and file
+    watchers saw, though FILE_LIST, the caller, is a pure read
+    (PROTOCOL.md). Nor is an answer kept: an empty folder's default would
+    stand after the folder had an entry to look up, where the probe file
+    had told, and looking again costs an entry or two.
     """
     p = Path(path)
     # Walk up until we find something that exists, so we can probe its parent.
@@ -616,27 +620,9 @@ def is_case_insensitive_fs(path: str | os.PathLike[str]) -> bool:
             # Fall back to OS default if we can't probe anything.
             return sys.platform in ("win32", "darwin")
     folds = _folds_case_by_lookup(probe_dir)
-    if folds is not None:
-        return folds
-    try:
-        # Create a temporary probe file; check whether its upper-cased name
-        # resolves to the same inode.
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(
-            dir=probe_dir, prefix=".aple_case_probe_", delete=False
-        ) as f:
-            probe_path = Path(f.name)
-        try:
-            upper = probe_path.parent / probe_path.name.upper()
-            return upper.exists()
-        finally:
-            try:
-                probe_path.unlink()
-            except OSError:
-                pass
-    except (OSError, PermissionError):
+    if folds is None:
         return sys.platform in ("win32", "darwin")
+    return folds
 
 
 # Swaps the case of ASCII letters alone, which every filesystem that folds

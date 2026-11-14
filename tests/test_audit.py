@@ -1733,11 +1733,14 @@ async def test_an_audit_command_never_makes_a_file_key_for_a_log(
 
 
 @pytest.mark.asyncio
-async def test_an_audit_command_never_stores_a_keychain_key(tmp_path: Path) -> None:
+async def test_an_audit_command_never_stores_a_keychain_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """With the keychain up and holding no key, `audit verify` stored a new
     one, which no existing log was signed with."""
     import keyring
 
+    monkeypatch.setenv("AUTOGPT_SHIM_FALLBACK_DIR", str(tmp_path))  # no file key either
     writer = _writer(tmp_path)
     await writer.write("EXECUTE_COMMAND", request_id="a", details={}, result={})
     stored: list[str] = []

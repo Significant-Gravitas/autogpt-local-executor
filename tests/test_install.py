@@ -543,6 +543,61 @@ def test_a_relative_path_entry_still_gives_an_absolute_command(
     assert command.endswith(str(Path("bin") / "autogpt-shim"))
 
 
+def _link_or_skip(link: Path, folder: Path) -> None:
+    """Make `link` a symlink to `folder`, or skip where symlinks can't be
+    made (Windows without the privilege)."""
+    try:
+        link.symlink_to(folder, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks can't be made here: {exc}")
+
+
+def test_a_config_path_through_a_link_and_dotdot_names_the_same_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """abspath() drops `link/..` without looking at the disk, so where
+    `link` is a symlink, `link/../config.toml` was stored as another file
+    than the one it names, and the service ran on that one, or failed to
+    start. The OS reads the path given: POSIX follows `link` before `..`,
+    and Windows drops `link\\..` itself, as abspath does."""
+    (tmp_path / "project" / "sub").mkdir(parents=True)
+    (tmp_path / "project" / "config.toml").write_text("# the one named\n", encoding="utf-8")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "config.toml").write_text("# another\n", encoding="utf-8")
+    _link_or_skip(work / "link", tmp_path / "project" / "sub")
+    monkeypatch.chdir(work)
+    monkeypatch.setattr(install_mod, "resolve_shim_command", lambda: ("/usr/bin/autogpt-shim",))
+    given = Path("link") / ".." / "config.toml"
+
+    ctx = install_mod.build_context(given)
+
+    assert ctx.config_path is not None and Path(ctx.config_path).is_absolute()
+    assert os.path.samefile(ctx.config_path, given)
+
+
+def test_a_path_entry_through_a_link_and_dotdot_gives_the_script_it_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """abspath() dropped `link/..` from the script `which` found without
+    looking at the disk, so a PATH entry through a symlinked folder gave the
+    service another program, or none."""
+    name = "autogpt-shim.exe" if sys.platform == "win32" else "autogpt-shim"
+    (tmp_path / "project" / "sub").mkdir(parents=True)
+    for folder in (tmp_path / "project" / "bin", tmp_path / "bin"):  # the named one, another
+        folder.mkdir()
+        (folder / name).write_text("", encoding="utf-8")
+        (folder / name).chmod(0o755)
+    _link_or_skip(tmp_path / "link", tmp_path / "project" / "sub")
+    entry = tmp_path / "link" / ".." / "bin"
+    monkeypatch.setenv("PATH", str(entry))
+
+    [command] = install_mod.resolve_shim_command()
+
+    assert Path(command).is_absolute()
+    assert os.path.samefile(command, entry / name)
+
+
 def test_a_failed_autostart_write_leaves_the_old_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

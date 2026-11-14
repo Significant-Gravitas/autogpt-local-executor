@@ -953,6 +953,38 @@ def test_install_gives_the_service_a_home_relative_root_expanded(
     )
 
 
+def test_install_gives_the_service_the_root_a_path_through_a_link_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """abspath() drops `link/..` without looking at the disk, so where
+    `link` is a symlink, `--allowed-root link/../ws` gave the service
+    another folder than the one it names. The OS reads the path given:
+    POSIX follows `link` before `..`, and Windows drops `link\\..` itself."""
+    install_autostart = _capture_install(tmp_path, monkeypatch)
+    (tmp_path / "project" / "sub").mkdir(parents=True)
+    (tmp_path / "project" / "ws").mkdir()
+    work = tmp_path / "work"
+    (work / "ws").mkdir(parents=True)  # another folder by that name
+    try:
+        (work / "link").symlink_to(tmp_path / "project" / "sub", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # Windows without the privilege
+        pytest.skip(f"symlinks can't be made here: {exc}")
+    monkeypatch.chdir(work)
+    given = str(Path("link") / ".." / "ws")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["autogpt-shim", "--config", str(_empty_config(tmp_path))]
+        + ["--allowed-root", given, "install"],
+    )
+
+    cli.main()
+
+    flag, root = install_autostart.call_args.kwargs["global_args"]
+    assert flag == "--allowed-root" and Path(root).is_absolute()
+    assert os.path.samefile(root, given)
+
+
 @pytest.mark.parametrize(("root", "refused"), [(".", True), ("files", True), ("~/ws", False)])
 def test_install_refuses_a_relative_root_from_the_config_file(
     tmp_path: Path,

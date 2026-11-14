@@ -932,14 +932,14 @@ class CommandHandler:
             timed_out = False
             stdout_b = stderr_b = b""
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                async with asyncio.timeout(timeout):
+                    stdout_b, stderr_b = await proc.communicate()
             except TimeoutError:
                 timed_out = True
                 await self._terminate_tree(proc)
-                try:
-                    stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2.0)
-                except TimeoutError:
-                    pass
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(2.0):
+                        stdout_b, stderr_b = await proc.communicate()
             output.feed("stdout", stdout_b)
             output.feed("stderr", stderr_b)
             kept_stdout, kept_stderr, truncated = output.finish()
@@ -960,10 +960,10 @@ class CommandHandler:
                 # command that has exited isn't timed out, and what it left
                 # running keeps running, as on any other exit. What is still
                 # in the pipes is read for _OUTPUT_DRAIN_SECONDS (below).
-                # Under asyncio.timeout, not wait_for: Python 3.11's wait_for
-                # drops a cancel that lands as the exit is seen, and a session
-                # revoked then left the command recorded as done, and what it
-                # started running.
+                # Both waits are under asyncio.timeout, not wait_for: Python
+                # 3.11's wait_for drops a cancel that lands as the exit is
+                # seen, or as the read ends, and a session revoked then left
+                # the command recorded as done, and what it started running.
                 async with asyncio.timeout(timeout):
                     await _exited(proc)
             except TimeoutError:
@@ -973,10 +973,8 @@ class CommandHandler:
                     async with asyncio.timeout(2.0):
                         await _exited(proc)
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(*drain_tasks, return_exceptions=True),
-                    timeout=_OUTPUT_DRAIN_SECONDS,
-                )
+                async with asyncio.timeout(_OUTPUT_DRAIN_SECONDS):
+                    await asyncio.gather(*drain_tasks, return_exceptions=True)
             except TimeoutError:
                 for task in drain_tasks:
                     task.cancel()
@@ -3067,10 +3065,10 @@ class LocalLLMHandler:
 
         async with self._inflight_lock:
             try:
-                return await asyncio.wait_for(
-                    self._run_completion(msg, send=send, details_base=details_base, start=start),
-                    timeout=local_llm_limits.TOTAL_TIMEOUT_SECONDS,
-                )
+                async with asyncio.timeout(local_llm_limits.TOTAL_TIMEOUT_SECONDS):
+                    return await self._run_completion(
+                        msg, send=send, details_base=details_base, start=start
+                    )
             except TimeoutError:
                 await self._emit(
                     msg.id,
@@ -3137,9 +3135,8 @@ class LocalLLMHandler:
                                 finish_reason=None,
                             ),
                         )
-                        await asyncio.wait_for(
-                            send(chunk_msg), timeout=local_llm_limits.IDLE_TIMEOUT_SECONDS
-                        )
+                        async with asyncio.timeout(local_llm_limits.IDLE_TIMEOUT_SECONDS):
+                            await send(chunk_msg)
 
                 if done:
                     # Emit terminal-marker chunk (delta="", finish_reason=stop/length)
@@ -3154,9 +3151,8 @@ class LocalLLMHandler:
                                 finish_reason=finish_reason,
                             ),
                         )
-                        await asyncio.wait_for(
-                            send(chunk_msg), timeout=local_llm_limits.IDLE_TIMEOUT_SECONDS
-                        )
+                        async with asyncio.timeout(local_llm_limits.IDLE_TIMEOUT_SECONDS):
+                            await send(chunk_msg)
                     break
         except OllamaBackendError as exc:
             details = {

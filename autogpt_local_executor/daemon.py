@@ -1105,7 +1105,8 @@ class ShimDaemon:
             raise RuntimeError("HELLO payload exceeds the WebSocket message limit")
         await ws.send(raw_hello)
         try:
-            raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
+            async with asyncio.timeout(10.0):
+                raw_ack = await ws.recv()
         except websockets.exceptions.ConnectionClosed as exc:
             received = getattr(exc, "rcvd", None)
             code = getattr(received, "code", None) or getattr(exc, "code", None)

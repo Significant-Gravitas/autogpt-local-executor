@@ -1596,8 +1596,21 @@ class ShimDaemon:
         starts: the close and the reconnect's backoff take seconds."""
         while self._running and self._ws is ws:
             await asyncio.sleep(DISPLAY_WATCH_SECONDS)
-            if not await asyncio.to_thread(
-                platform_info.can_do_computer_use, self.config.cua_driver_path
+            # The driver, through the bridge's look (find_binary, one at a
+            # time), within DRIVER_LOOKUP_SECONDS as HELLO's is, then the
+            # display, told what it found. A look of the watch's own, in a
+            # worker thread it waited for to the end, was held by a stalled
+            # mount on sys.path or PATH, and the reconnect that cancelled the
+            # watch left the thread held: one more for each connection.
+            try:
+                async with asyncio.timeout(handlers.DRIVER_LOOKUP_SECONDS):
+                    found = await self._computer_handler.driver.find_binary() is not None
+            except TimeoutError:
+                continue
+            if not found or not await asyncio.to_thread(
+                platform_info.can_do_computer_use,
+                self.config.cua_driver_path,
+                driver_found=True,
             ):
                 continue
             if self._ws is not ws or not self._quiet_enough_for_a_new_hello():

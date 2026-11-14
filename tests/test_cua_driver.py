@@ -3569,6 +3569,90 @@ async def test_hello_goes_out_without_computer_use_while_the_look_for_the_driver
     assert "computer_use" in later.payload.capabilities
 
 
+def _stall_the_look(monkeypatch: pytest.MonkeyPatch, *, installed: bool = True):
+    """Make the look for the driver stall until the event returned is set,
+    then find it, or not; returns the event and the list of looks made."""
+    released = threading.Event()
+    looks: list[int] = []
+    find = driver.find_driver_binary
+
+    def stalled(explicit: Any = None) -> Any:
+        looks.append(threading.get_ident())
+        released.wait(timeout=60)
+        return find(explicit) if installed else None
+
+    monkeypatch.setattr(driver, "find_driver_binary", stalled)
+    return released, looks
+
+
+@pytest.mark.parametrize("installed", [True, False])
+async def test_a_start_whose_look_for_the_driver_stalls_goes_on_to_connect(
+    tmp_path, fake_log, linux_with_display, monkeypatch, installed: bool
+) -> None:
+    """A start waited for the look for the driver to the end before it
+    connected, so a stalled mount on PATH or sys.path kept the machine
+    offline, file and shell work too, and HELLO's own bounded wait never
+    came into it. The start waits DRIVER_PREFLIGHT_SECONDS for the look now
+    and goes on; another start waits for the same look rather than start
+    one more, and HELLO offers computer use once the look has found the
+    driver, and not if it found none."""
+    from autogpt_local_executor import daemon as daemon_module
+
+    released, looks = _stall_the_look(monkeypatch, installed=installed)
+    monkeypatch.setattr(daemon_module, "DRIVER_PREFLIGHT_SECONDS", 0.2, raising=False)
+    monkeypatch.setattr(handlers_module, "DRIVER_LOOKUP_SECONDS", 0.2, raising=False)
+    daemon = _daemon(tmp_path, session_id=None)
+    try:
+        await asyncio.wait_for(daemon._preflight_or_raise(), timeout=30)
+        await asyncio.wait_for(daemon._preflight_or_raise(), timeout=30)
+        assert len(looks) == 1
+        meanwhile = await asyncio.wait_for(daemon._build_hello(), timeout=30)
+        released.set()
+        later = await asyncio.wait_for(daemon._build_hello(), timeout=30)
+    finally:
+        released.set()
+        await daemon._computer_handler.close()
+
+    assert "files" in meanwhile.payload.capabilities
+    assert "computer_use" not in meanwhile.payload.capabilities
+    assert ("computer_use" in later.payload.capabilities) is installed
+
+
+async def test_a_mac_start_that_went_on_offers_no_computer_use_until_a_check_passes(
+    tmp_path, fake_log, monkeypatch
+) -> None:
+    """On macOS the start checks the Accessibility and Screen Recording
+    grants once it has the driver. One that went on while its look for the
+    driver stalled checked nothing, so HELLO leaves computer use out, even
+    once the look finds the driver, until a session's check has passed: a
+    chat's, here."""
+    from autogpt_local_executor import daemon as daemon_module
+    from autogpt_local_executor import platform_info
+
+    monkeypatch.setattr(platform_info, "detect_platform", lambda: "darwin")
+    released, _looks = _stall_the_look(monkeypatch)
+    monkeypatch.setattr(daemon_module, "DRIVER_PREFLIGHT_SECONDS", 0.2, raising=False)
+    # The chat's check starts the driver, which a slow machine may take a
+    # while to do: its check runs in full here.
+    monkeypatch.setattr(handlers_module, "CHILD_DRIVER_WAIT_SECONDS", 60.0, raising=False)
+    parent = _daemon(tmp_path, session_id=None)
+    child = _daemon(tmp_path, session_id="child-1")
+    parent._computer_handler.share_with(child._computer_handler)
+    try:
+        await asyncio.wait_for(parent._preflight_or_raise(), timeout=30)
+        released.set()
+        unchecked = await asyncio.wait_for(parent._build_hello(), timeout=30)
+        await asyncio.wait_for(child._preflight_or_raise(), timeout=30)
+        checked = await asyncio.wait_for(parent._build_hello(), timeout=30)
+    finally:
+        released.set()
+        await parent._computer_handler.close()
+
+    assert "files" in unchecked.payload.capabilities
+    assert "computer_use" not in unchecked.payload.capabilities
+    assert "computer_use" in checked.payload.capabilities
+
+
 async def test_computer_tool_calls_need_the_granted_capability(tmp_path, fake_log) -> None:
     daemon = _daemon(tmp_path)
     daemon._granted_capabilities = frozenset({"files"})

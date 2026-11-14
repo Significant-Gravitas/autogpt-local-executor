@@ -257,7 +257,7 @@ def test_the_console_script_beside_the_interpreter_is_next(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     script = bin_dir / ("autogpt-shim.exe" if sys.platform == "win32" else "autogpt-shim")
-    script.write_text("")
+    script.write_text("", encoding="utf-8")
     script.chmod(0o755)
     monkeypatch.setattr(install_mod.sys, "executable", str(bin_dir / "python"))
     monkeypatch.setattr(install_mod.shutil, "which", _which_without_path(None))
@@ -342,7 +342,7 @@ def test_install_macos_writes_plist(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     expected = tmp_path / "Library" / "LaunchAgents" / "net.autogpt.shim.plist"
     assert status.target_path == expected
     assert expected.is_file()
-    content = expected.read_text()
+    content = expected.read_text(encoding="utf-8")
     assert "net.autogpt.shim" in content
     assert "<key>RunAtLoad</key>" in content
     assert "<key>KeepAlive</key>" in content
@@ -368,7 +368,7 @@ def test_install_linux_writes_systemd_unit(tmp_path: Path, monkeypatch: pytest.M
     expected = tmp_path / ".config" / "systemd" / "user" / "autogpt-shim.service"
     assert status.target_path == expected
     assert expected.is_file()
-    content = expected.read_text()
+    content = expected.read_text(encoding="utf-8")
     assert "ExecStart=/usr/bin/autogpt-shim --config" in content
     assert "Restart=on-failure" in content
 
@@ -604,7 +604,7 @@ def test_a_failed_autostart_write_leaves_the_old_file(
     """_write_atomic truncated the file in place, so a failed write left it
     half written."""
     target = tmp_path / "autogpt-shim.service"
-    target.write_text("the working unit")
+    target.write_text("the working unit", encoding="utf-8")
 
     def refuse(*_args) -> None:
         raise OSError("disk full")
@@ -614,7 +614,7 @@ def test_a_failed_autostart_write_leaves_the_old_file(
         install_mod._write_atomic(target, "a new unit")
     monkeypatch.undo()
 
-    assert target.read_text() == "the working unit"
+    assert target.read_text(encoding="utf-8") == "the working unit"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["autogpt-shim.service"]
 
 
@@ -642,7 +642,7 @@ def test_two_writes_to_one_target_that_overlap_both_finish(
     monkeypatch.undo()
 
     assert len(set(renamed)) == 2
-    assert target.read_text() == "first"
+    assert target.read_text(encoding="utf-8") == "first"
     assert sorted(p.name for p in tmp_path.iterdir()) == [target.name]
 
 
@@ -651,12 +651,12 @@ def test_a_write_leaves_another_installs_temporary_file_alone(tmp_path: Path) ->
     the other's file, or rename it away before the other had finished."""
     target = tmp_path / "autogpt-shim.service"
     theirs = tmp_path / f".{target.name}.tmp"
-    theirs.write_text("another install, part way through")
+    theirs.write_text("another install, part way through", encoding="utf-8")
 
     install_mod._write_atomic(target, "mine")
 
-    assert target.read_text() == "mine"
-    assert theirs.read_text() == "another install, part way through"
+    assert target.read_text(encoding="utf-8") == "mine"
+    assert theirs.read_text(encoding="utf-8") == "another install, part way through"
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted([theirs.name, target.name])
 
 
@@ -669,7 +669,7 @@ def test_the_default_config_is_pinned_only_when_it_exists(
     the shim finds the default itself."""
     default = tmp_path / "config.toml"
     if exists:
-        default.write_text("")
+        default.write_text("", encoding="utf-8")
     monkeypatch.setattr(install_mod, "default_config_path", lambda: default)
     monkeypatch.setattr(install_mod, "resolve_shim_command", lambda: ("/usr/bin/autogpt-shim",))
 

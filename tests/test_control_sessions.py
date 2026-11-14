@@ -115,7 +115,9 @@ async def test_control_attach_uses_host_ref_and_does_not_mutate_global_root(tmp_
         assert daemon._directory_browser is not None
         daemon._directory_browser.resolve(browse_id, directory_ref)
 
-    records = [json.loads(line) for line in daemon.audit.path.read_text().splitlines()]
+    records = [
+        json.loads(line) for line in daemon.audit.path.read_text(encoding="utf-8").splitlines()
+    ]
     list_records = [record for record in records if record["op"] == "DIRECTORY_LIST"]
     assert list_records
     assert all("entries" not in record["details"] for record in list_records)
@@ -324,7 +326,7 @@ async def test_session_bound_audits_share_chain_without_context_leak(tmp_path: P
         second.write("TEST", request_id="two", details={}),
     )
 
-    records = [json.loads(line) for line in writer.path.read_text().splitlines()]
+    records = [json.loads(line) for line in writer.path.read_text(encoding="utf-8").splitlines()]
     assert {record["session_id"] for record in records} == {"session-1", "session-2"}
     assert AuditWriter.verify(writer.path, b"a" * 32) == []
 
@@ -1259,7 +1261,10 @@ def _hold_the_audit_writer(daemon: ShimDaemon, monkeypatch: pytest.MonkeyPatch) 
 
 
 def _revocations(daemon: ShimDaemon) -> list[dict[str, Any]]:
-    records = (json.loads(line) for line in daemon.config.audit_log_path.read_text().splitlines())
+    records = (
+        json.loads(line)
+        for line in daemon.config.audit_log_path.read_text(encoding="utf-8").splitlines()
+    )
     return [record["details"] for record in records if record["op"] == "SESSION_REVOKED"]
 
 

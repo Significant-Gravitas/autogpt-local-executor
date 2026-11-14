@@ -600,7 +600,7 @@ async def test_a_linux_driver_runs_in_an_empty_folder_of_its_own(
                 assert stat.S_IMODE(folder.stat().st_mode) == 0o500
                 if os.geteuid() != 0:
                     with pytest.raises(PermissionError):
-                        (folder / "notes.txt").write_text("x")
+                        (folder / "notes.txt").write_text("x", encoding="utf-8")
         else:
             assert os.path.samefile(folder, tmp_path)
     finally:
@@ -919,9 +919,9 @@ def test_the_wheels_binary_is_found_without_importing_the_package(
     not."""
     package = tmp_path / "cua_driver"
     (package / "bin").mkdir(parents=True)
-    (package / "__init__.py").write_text("raise RuntimeError('imported')\n")
+    (package / "__init__.py").write_text("raise RuntimeError('imported')\n", encoding="utf-8")
     name = "cua-driver.exe" if sys.platform == "win32" else "cua-driver"
-    (package / "bin" / name).write_text("")
+    (package / "bin" / name).write_text("", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.delitem(sys.modules, "cua_driver", raising=False)
 
@@ -936,7 +936,7 @@ def test_an_explicit_driver_in_the_current_folder_runs_from_there(
     a bare `cua-driver`, which the OS looks up on PATH: another install ran,
     or none did, in place of the file the shim had checked."""
     name = "cua-driver.exe" if sys.platform == "win32" else "cua-driver"
-    (tmp_path / name).write_text("")
+    (tmp_path / name).write_text("", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
     found = driver.find_driver_binary(f"./{name}")
@@ -1332,7 +1332,7 @@ def _call(tool: str, arguments: dict | None = None, **payload: Any) -> ComputerT
 def _audit(tmp_path: Path) -> list[dict]:
     return [
         json.loads(line)
-        for line in (tmp_path / "audit.log").read_text().splitlines()
+        for line in (tmp_path / "audit.log").read_text(encoding="utf-8").splitlines()
         if '"COMPUTER_TOOL_CALL"' in line
     ]
 
@@ -1456,7 +1456,7 @@ async def test_a_call_is_relayed_with_this_sessions_label(make_handler, fake_log
     # What was typed stays out of the audit log.
     [record] = _audit(tmp_path)
     assert record["details"]["arguments"]["text"] == {"redacted_chars": 7}
-    assert "hunter2" not in (tmp_path / "audit.log").read_text()
+    assert "hunter2" not in (tmp_path / "audit.log").read_text(encoding="utf-8")
     assert record["result"]["ok"] is True
 
 
@@ -2809,7 +2809,7 @@ async def test_clipboard_reads_return_this_shims_recent_write(make_handler) -> N
 
 async def test_clipboard_reads_refuse_what_the_shim_did_not_write(make_handler, tmp_path) -> None:
     handler = make_handler(enable_clipboard=True)
-    (tmp_path / "clipboard.txt").write_text("the person's password")
+    (tmp_path / "clipboard.txt").write_text("the person's password", encoding="utf-8")
 
     response = await handler.handle(_call("clipboard_read"))
 
@@ -2822,7 +2822,7 @@ async def test_clipboard_reads_refuse_what_the_shim_did_not_write(make_handler, 
 async def test_clipboard_reads_refuse_a_write_since_overwritten(make_handler, tmp_path) -> None:
     handler = make_handler(enable_clipboard=True)
     await handler.handle(_call("clipboard_write", {"text": "from the agent"}))
-    (tmp_path / "clipboard.txt").write_text("copied by the person")
+    (tmp_path / "clipboard.txt").write_text("copied by the person", encoding="utf-8")
 
     response = await handler.handle(_call("clipboard_read"))
 
@@ -2873,7 +2873,7 @@ async def test_foreign_clipboard_reads_return_unmarked_text(
     make_handler, tmp_path, a_clean_clipboard
 ) -> None:
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("a copied paragraph")
+    (tmp_path / "clipboard.txt").write_text("a copied paragraph", encoding="utf-8")
 
     response = await handler.handle(_call("clipboard_read"))
 
@@ -2886,7 +2886,7 @@ async def test_foreign_clipboard_reads_refuse_a_password_managers_copy(
     make_handler, tmp_path, a_clean_clipboard, when: str
 ) -> None:
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("s3cret")
+    (tmp_path / "clipboard.txt").write_text("s3cret", encoding="utf-8")
     marked = concealed.ClipboardState("org.nspasteboard.ConcealedType", 7)
     clean = concealed.ClipboardState(None, 7)
     a_clean_clipboard.extend([marked] if when == "before" else [clean, marked])
@@ -2904,7 +2904,7 @@ async def test_foreign_clipboard_reads_check_the_types_the_driver_read(
 ) -> None:
     monkeypatch.setenv("FAKE_CUA_CLIPBOARD_TYPES", "UTF8_STRING,x-kde-passwordManagerHint")
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("s3cret")
+    (tmp_path / "clipboard.txt").write_text("s3cret", encoding="utf-8")
 
     response = await handler.handle(_call("clipboard_read"))
 
@@ -2916,7 +2916,7 @@ async def test_foreign_clipboard_reads_refuse_a_copy_made_during_the_read(
     make_handler, tmp_path, a_clean_clipboard
 ) -> None:
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("whatever")
+    (tmp_path / "clipboard.txt").write_text("whatever", encoding="utf-8")
     a_clean_clipboard.extend([concealed.ClipboardState(None, 7), concealed.ClipboardState(None, 8)])
 
     response = await handler.handle(_call("clipboard_read"))
@@ -2933,7 +2933,7 @@ async def test_foreign_clipboard_reads_without_a_sequence_number_read_twice(
     replaced before the shim looked again, came back as clean text."""
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
     clipboard = tmp_path / "clipboard.txt"
-    clipboard.write_text("s3cret")  # read while its marker went unseen
+    clipboard.write_text("s3cret", encoding="utf-8")  # read while its marker went unseen
     a_clean_clipboard.extend([concealed.ClipboardState(None), concealed.ClipboardState(None)])
     driver = handler.driver
     real_call = driver.call_tool
@@ -2941,7 +2941,7 @@ async def test_foreign_clipboard_reads_without_a_sequence_number_read_twice(
     async def call_tool(name: str, arguments: dict, **kwargs: Any) -> dict:
         result = await real_call(name, arguments, **kwargs)
         if name == "clipboard_read":
-            clipboard.write_text("copied after it")  # the clipboard moves on
+            clipboard.write_text("copied after it", encoding="utf-8")  # the clipboard moves on
         return result
 
     driver.call_tool = call_tool  # type: ignore[method-assign]
@@ -2958,7 +2958,7 @@ async def test_a_second_read_that_finds_the_same_text_returns_it(
     make_handler, tmp_path, a_clean_clipboard
 ) -> None:
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("a copied paragraph")
+    (tmp_path / "clipboard.txt").write_text("a copied paragraph", encoding="utf-8")
     a_clean_clipboard.extend([concealed.ClipboardState(None), concealed.ClipboardState(None)])
 
     response = await handler.handle(_call("clipboard_read"))
@@ -2983,7 +2983,7 @@ async def test_a_clipboard_read_whose_deadline_passes_in_the_marker_check_never_
 
     monkeypatch.setattr(handlers, "clipboard_state", slow_look)
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("a copied paragraph")
+    (tmp_path / "clipboard.txt").write_text("a copied paragraph", encoding="utf-8")
 
     response = await handler.handle(_call("clipboard_read", timeout_seconds=1))
 
@@ -3019,7 +3019,7 @@ async def test_a_look_at_the_clipboard_not_back_by_the_deadline_ends_the_call(
 
     monkeypatch.setattr(handlers, "clipboard_state", look)
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("a copied paragraph")
+    (tmp_path / "clipboard.txt").write_text("a copied paragraph", encoding="utf-8")
     await handler.driver.snapshot()  # started, so the call's second goes to the look
     try:
         response = await asyncio.wait_for(
@@ -3052,7 +3052,7 @@ async def test_each_look_at_a_foreign_clipboard_gets_only_the_time_left(
 
     monkeypatch.setattr(handlers, "clipboard_state", look)
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("a copied paragraph")
+    (tmp_path / "clipboard.txt").write_text("a copied paragraph", encoding="utf-8")
 
     response = await handler.handle(_call("clipboard_read", timeout_seconds=2))
 
@@ -3073,7 +3073,7 @@ async def test_a_second_clipboard_read_never_starts_past_the_deadline(
         handlers, "clipboard_state", lambda _timeout=None: concealed.ClipboardState(None)
     )
     handler = make_handler(enable_clipboard=True, enable_clipboard_read_foreign=True)
-    (tmp_path / "clipboard.txt").write_text("a copied paragraph")
+    (tmp_path / "clipboard.txt").write_text("a copied paragraph", encoding="utf-8")
     loop = asyncio.get_running_loop()
     deadlines: list[float] = []
     real_deadline = handlers.ComputerUseHandler.call_deadline

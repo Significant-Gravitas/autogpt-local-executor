@@ -2256,6 +2256,128 @@ async def test_a_command_that_exits_leaving_a_child_on_its_output_is_done_when_i
     assert await _wait_until(survived.exists, timeout=60)
 
 
+def _a_command_leaving_a_writer(folder: Path) -> list[str]:
+    """A command that exits once it has started a program holding its
+    stdout and stderr (a server started in the background, say). Once `go`
+    is made in `folder`, the program writes 4 MiB to each, far past any
+    pipe's buffer, then makes `wrote`; it exits once `stop` is made, or a
+    minute after its start. Its PID is in `pid`."""
+    pid, go, wrote, stop = (str(folder / name) for name in ("pid", "go", "wrote", "stop"))
+    program = textwrap.dedent(
+        f"""
+        import os, time
+        deadline = time.monotonic() + 60
+        def wait_for(path):
+            while not os.path.exists(path) and time.monotonic() < deadline:
+                time.sleep(0.01)
+        with open({pid!r} + ".tmp", "w") as f:
+            f.write(str(os.getpid()))
+        os.replace({pid!r} + ".tmp", {pid!r})
+        wait_for({go!r})
+        chunk = memoryview(b"x" * 65536)
+        for _ in range(64):
+            for fd in (1, 2):
+                left = chunk
+                while left:
+                    left = left[os.write(fd, left):]
+        open({wrote!r} + ".tmp", "w").close()
+        os.replace({wrote!r} + ".tmp", {wrote!r})
+        wait_for({stop!r})
+        """
+    )
+    command = textwrap.dedent(
+        f"""
+        import os, subprocess, sys, time
+        subprocess.Popen([sys.executable, "-c", {program!r}], stdout=1, stderr=2)
+        while not os.path.exists({pid!r}):
+            time.sleep(0.01)
+        print("started", flush=True)
+        """
+    )
+    return [sys.executable, "-c", command]
+
+
+def _let_the_writer_go(folder: Path) -> None:
+    """Have _a_command_leaving_a_writer's program exit, and end it if it is
+    still stuck writing."""
+    (folder / "stop").touch()
+    if not (folder / "wrote").exists():
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int((folder / "pid").read_text()), signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+async def test_a_program_left_on_a_commands_output_never_stops_on_a_full_pipe(
+    tmp_path: Path,
+) -> None:
+    """A command that had exited was done once its output was read for
+    _OUTPUT_DRAIN_SECONDS more, and nothing read its pipes after that,
+    though a program it left running (a server started in the background)
+    still held them. Once they filled, the program stopped on its next
+    write, for good, or ended on a broken pipe once they were collected.
+    What it writes after the result is read and dropped now, until it
+    closes them."""
+    config = make_config(tmp_path)
+    config.command_timeout_seconds = 600
+    handler = CommandHandler(config)
+    try:
+        response = await handler.handle(
+            _cmd_msg(
+                argv=_a_command_leaving_a_writer(tmp_path), cwd=str(tmp_path), timeout_seconds=40
+            )
+        )
+
+        assert isinstance(response, CommandResultMessage)
+        assert response.payload.timed_out is False
+        assert response.payload.exit_code == 0
+        assert response.payload.stdout.strip() == "started"
+        (tmp_path / "go").touch()
+        assert await _wait_until((tmp_path / "wrote").exists, timeout=60)
+        (tmp_path / "stop").touch()
+        # Its pipes closed as it exited, and the handler let go of them.
+        assert await _wait_until(lambda: not handler._output_drains, timeout=60)
+    finally:
+        _let_the_writer_go(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_what_a_chats_command_left_running_is_read_until_the_machines_handler_closes(
+    tmp_path: Path,
+) -> None:
+    """A chat ends long before a server one of its commands started, so a
+    chat's handler leaves such a program's output to the machine's, whose
+    close, as the shim stops, ends the reads at once: the program may never
+    close its output."""
+    config = make_config(tmp_path)
+    config.command_timeout_seconds = 600
+    machine, chat = CommandHandler(config), CommandHandler(config)
+    machine.share_with(chat)
+    try:
+        response = await chat.handle(
+            _cmd_msg(
+                argv=_a_command_leaving_a_writer(tmp_path), cwd=str(tmp_path), timeout_seconds=40
+            )
+        )
+        assert isinstance(response, CommandResultMessage)
+        await chat.close()
+
+        (tmp_path / "go").touch()
+        assert await _wait_until((tmp_path / "wrote").exists, timeout=60)
+        [(reading, command)] = machine._output_drains.items()
+        await asyncio.wait_for(machine.close(), timeout=30)
+        assert reading.cancelled()
+        assert not machine._output_drains
+
+        # The program exits, and its pipes, read to their end, close before
+        # this test's event loop does.
+        (tmp_path / "stop").touch()
+        await asyncio.wait_for(
+            handlers_module._discard_until_closed((command.stdout, command.stderr)), timeout=60
+        )
+    finally:
+        _let_the_writer_go(tmp_path)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 @pytest.mark.asyncio
 async def test_a_group_stop_cut_short_in_its_grace_period_kills_the_group(

@@ -667,6 +667,7 @@ class ShimDaemon:
         finally:
             if self._control_mode:
                 await self._shutdown_children()
+            await self._command_handler.close()
             await self._computer_handler.close()
             if self._manage_audit_lifecycle:
                 await self._audit_shim_stop("graceful")
@@ -2299,8 +2300,7 @@ class ShimDaemon:
                 machine_work_semaphore=self._machine_work_semaphore,
                 computer_use_lock=self._computer_use_lock,
             )
-            child._command_handler._command_rate = self._command_handler._command_rate
-            child._command_handler._concurrency = self._command_handler._concurrency
+            self._command_handler.share_with(child._command_handler)
             self._computer_handler.share_with(child._computer_handler)
             child._local_llm_handler._inflight_lock = self._local_llm_handler._inflight_lock
             task = asyncio.create_task(child.run(), name=f"local-executor-{binding.session_id}")
